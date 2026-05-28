@@ -1,5 +1,6 @@
 import * as opentype from 'opentype.js';
 import { GlyphData, FontConfig } from '../types';
+import { isValidCharacterUnicode, isBannedGlyphName } from './contourTracer';
 
 export function buildTrueTypeFont(
   glyphs: GlyphData[],
@@ -44,6 +45,14 @@ export function buildTrueTypeFont(
 
   // 3. Process all user-created handwriting glyphs
   for (const glyph of glyphs) {
+    if (!isValidCharacterUnicode(glyph.char)) continue;
+    
+    const glyphName = getGlyphName(glyph.char);
+    if (isBannedGlyphName(glyphName)) continue;
+
+    // Skip entirely empty glyphs (where all contours were deleted as trash/leaked grid lines)
+    if (!glyph.paths || glyph.paths.length === 0) continue;
+
     const path = new opentype.Path();
 
     // Map custom command list into opentype Path operations
@@ -70,7 +79,6 @@ export function buildTrueTypeFont(
     }
 
     const charCode = glyph.char.charCodeAt(0);
-    const glyphName = getGlyphName(glyph.char);
 
     const otGlyph = new opentype.Glyph({
       name: glyphName,

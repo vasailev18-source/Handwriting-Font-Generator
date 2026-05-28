@@ -60,16 +60,16 @@ export default function LetterCanvas({ onGlyphSaved, savedGlyphsMap }: LetterCan
     ctx.fillStyle = '#0f172a';
     ctx.beginPath();
     const W = canvas.width;
-    const letterCanvasBaselineY = W * 0.85; // Exactly 85% of canvas height
-    const FONT_HEIGHT_UNITS = 12000;
+    const letterCanvasBaselineY = W * 0.75; // Exactly 75% of canvas height (avoids descender clipping)
+    const FONT_HEIGHT_UNITS = 13500;
     const verticalScale = letterCanvasBaselineY / FONT_HEIGHT_UNITS;
 
     for (const contour of existing.paths) {
       let first = true;
+      const leftMargin = (W - existing.width * verticalScale) / 2;
       for (const pt of contour) {
-        // Inverse transform based on dynamic canvas width matching our uniform coordinates
-        // X: scale [0, existing.width] with elegant 10% side padding
-        const cx = (W * 0.1) + pt.x! * ((W * 0.8) / (existing.width || 1));
+        // Inverse transform using mathematically correct uniform scaling with original proportions
+        const cx = leftMargin + pt.x! * verticalScale;
 
         // Y:
         const cy = letterCanvasBaselineY - pt.y! * verticalScale;
@@ -80,7 +80,7 @@ export default function LetterCanvas({ onGlyphSaved, savedGlyphsMap }: LetterCan
         } else if (pt.type === 'L') {
           ctx.lineTo(cx, cy);
         } else if (pt.type === 'Q') {
-          const cx1 = (W * 0.1) + pt.x1! * ((W * 0.8) / (existing.width || 1));
+          const cx1 = leftMargin + pt.x1! * verticalScale;
           const cy1 = letterCanvasBaselineY - pt.y1! * verticalScale;
           ctx.quadraticCurveTo(cx1, cy1, cx, cy);
         } else if (pt.type === 'Z') {
@@ -237,21 +237,21 @@ export default function LetterCanvas({ onGlyphSaved, savedGlyphsMap }: LetterCan
             {/* Typography Grid Guidelines alignment */}
             <div className="absolute inset-0 pointer-events-none">
               {/* Baseline */}
-              <div className="absolute top-[85%] left-0 w-full border-t-2 border-dashed border-red-200/50 flex justify-end px-3">
+              <div className="absolute top-[75%] left-0 w-full border-t-2 border-dashed border-red-200/50 flex justify-end px-3">
                 <span className="text-[8px] text-red-400 font-mono font-bold tracking-wider uppercase select-none">Базовая линия</span>
               </div>
               
               {/* x-Height (for standard lowercases) */}
               {alignInfo.type === 'standard' && (
-                <div className="absolute top-[40%] left-0 w-full border-t border-dashed border-blue-300/30"></div>
+                <div className="absolute top-[40.5%] left-0 w-full border-t border-dashed border-blue-300/30"></div>
               )}
               {/* Cap height (for upper/talls) */}
               {alignInfo.type === 'tall' && (
-                <div className="absolute top-[15%] left-0 w-full border-t border-dashed border-blue-300/40"></div>
+                <div className="absolute top-[24%] left-0 w-full border-t border-dashed border-blue-300/40"></div>
               )}
 
               {/* Faint character help backdrop to let user trace */}
-              <div className="absolute inset-0 flex items-center justify-center pointer-events-none select-none opacity-[0.05]">
+              <div className="absolute inset-0 flex items-center justify-center pointer-events-none select-none opacity-[0.05] -translate-y-[10%]">
                 <span className="text-[120px] font-sans font-light">{currentChar}</span>
               </div>
             </div>

@@ -100,8 +100,8 @@ export default function GridScanner({ onGlyphsExtracted, extractedGlyphsCount }:
     try {
       const page = await pdf.getPage(pageNum);
       
-      // Use a resolution multiplier of 2.0 to ensure glyph lines stay clean and crisp
-      const viewport = page.getViewport({ scale: 2.0 });
+      // Use a resolution multiplier of 4.0 to ensure glyph lines stay clean and crisp (maximum possible resolution)
+      const viewport = page.getViewport({ scale: 4.0 });
       
       const canvas = document.createElement('canvas');
       canvas.width = viewport.width;
@@ -261,15 +261,43 @@ export default function GridScanner({ onGlyphsExtracted, extractedGlyphsCount }:
       if (!srcCtx) throw new Error('Could not create Canvas context');
       srcCtx.drawImage(uploadedImgRef.current, 0, 0);
 
-      // 2. Warp image into normalized A4 coordinate space with double high resolution (1600 x 2262 px)
-      const targetW = 1600;
-      const targetH = 2262;
+      // 2. Warp image into normalized A4 coordinate space with ultra high 300 DPI resolution (2480 x 3508 px)
+      const targetW = 2480;
+      const targetH = 3508;
       const warpedCanvas = warpImage(srcCanvas, corners, targetW, targetH);
+
+      const cellW = targetW / activeTemplate.cols;
+      const cellH = targetH / activeTemplate.rows;
+
+      // Draw white lines directly over all grid cell boundaries on warpedCanvas to cleanly delete physical table borders.
+      // This leaves the interior of every cell completely original and guarantees letters are never clipped.
+      const warpedCtx = warpedCanvas.getContext('2d');
+      if (warpedCtx) {
+        warpedCtx.strokeStyle = 'white';
+        
+        // Erase vertical grid lines centered at col * cellW (2% cellW width easily clears modern borders without clipping)
+        warpedCtx.lineWidth = Math.max(2, Math.round(cellW * 0.02));
+        for (let c = 0; c <= activeTemplate.cols; c++) {
+          const x = c * cellW;
+          warpedCtx.beginPath();
+          warpedCtx.moveTo(x, 0);
+          warpedCtx.lineTo(x, targetH);
+          warpedCtx.stroke();
+        }
+
+        // Erase horizontal grid lines centered at row * cellH (2% cellH width)
+        warpedCtx.lineWidth = Math.max(2, Math.round(cellH * 0.02));
+        for (let r = 0; r <= activeTemplate.rows; r++) {
+          const y = r * cellH;
+          warpedCtx.beginPath();
+          warpedCtx.moveTo(0, y);
+          warpedCtx.lineTo(targetW, y);
+          warpedCtx.stroke();
+        }
+      }
 
       // 3. Loop through template cells to slice and parse letters
       const extractedGlyphs: GlyphData[] = [];
-      const cellW = targetW / activeTemplate.cols;
-      const cellH = targetH / activeTemplate.rows;
 
       // Offscreen canvas for individual cell (2048x2048 hyper-high-resolution block)
       const cellCanvas = document.createElement('canvas');
@@ -286,16 +314,14 @@ export default function GridScanner({ onGlyphsExtracted, extractedGlyphsCount }:
         const srcX = cell.col * cellW;
         const srcY = cell.row * cellH;
 
-        // Shrink bounds slightly to crop inside cell margins to avoid printing lines
-        const marginX = cellW * 0.11;
-        const marginY = cellH * 0.11;
-        const cropOffsetY = Math.round(cellH * 0.04);
-
-        const srcW_crop = cellW - marginX * 2;
-        const srcH_crop = cellH - marginY * 2 - cropOffsetY;
+        // Perfect original resolution and aspect ratio (no margins cropped at page slicing level)
+        const marginX = 0;
+        const marginY = 0;
+        const srcW_crop = cellW;
+        const srcH_crop = cellH;
 
         // Scale and center uniformly so we preserve writing aspect ratios and keep safe margins
-        const maxInnerSize = 1680;
+        const maxInnerSize = 1960;
         const scale = Math.min(maxInnerSize / srcW_crop, maxInnerSize / srcH_crop);
         const destW = srcW_crop * scale;
         const destH = srcH_crop * scale;
@@ -306,8 +332,8 @@ export default function GridScanner({ onGlyphsExtracted, extractedGlyphsCount }:
         cellCtx.fillRect(0, 0, 2048, 2048);
         cellCtx.drawImage(
           warpedCanvas,
-          srcX + marginX,
-          srcY + marginY + cropOffsetY, // Offset vertically dynamically to avoid top index label while keeping vertical alignment perfectly centered
+          srcX,
+          srcY,
           srcW_crop,
           srcH_crop,
           destX,
@@ -326,16 +352,17 @@ export default function GridScanner({ onGlyphsExtracted, extractedGlyphsCount }:
         cellCtx.fillRect(0, 0, edgeClear, 2048);                      // Left canvas edge
         cellCtx.fillRect(2048 - edgeClear, 0, edgeClear, 2048);        // Right canvas edge
 
-        // 2. Erase ONLY the small top-left printed reference digit/letter (e.g. "А", "Б" etc.)
-        // This is strictly in the top-left corner of the cropped cell bounding area.
-        const labelW = Math.max(272, Math.round(destW * 0.22));
-        const labelH = Math.max(240, Math.round(destH * 0.15));
+        // 2. Erase the top-left printed reference digit/letter label (e.g. "А", "Б", "восклицание" etc.)
+        // Highly adaptive based on the label string length to completely eliminate any printed label remnants!
+        const labelLength = cell.label ? cell.label.length : 1;
+        const labelW = Math.round(destW * (0.15 + Math.min(8, labelLength) * 0.06));
+        const labelH = Math.round(destH * 0.17);
         cellCtx.fillRect(destX, destY, labelW, labelH);
 
-        // 3. Clear any leaked cell grid borders (left, right, top, bottom edges of the drawn area)
-        // This is extremely important to prevent cumulative paper warp drift from scanning border lines
-        const borderW = Math.round(destW * 0.095); // 9.5% boundary margin to swallow any grid line leaks
-        const borderH = Math.round(destH * 0.095); // 9.5% boundary margin to swallow any grid line leaks
+        // 3. Clear any physical deskew line remnants utilizing an extremely conservative safety zone (1%)
+        // This completely swallows black grid borders while keeping wide handwritten letters perfectly intact and centered!
+        const borderW = Math.max(1, Math.round(destW * 0.01));
+        const borderH = Math.max(1, Math.round(destH * 0.01));
         
         // Left border of the cropped cell
         cellCtx.fillRect(destX, destY, borderW, destH);
@@ -465,16 +492,16 @@ export default function GridScanner({ onGlyphsExtracted, extractedGlyphsCount }:
       ctx.fillStyle = '#0f172a';
       ctx.beginPath();
       const W = canvas.width;
-      const retouchBaselineY = W * 0.85; // Exactly 85% of the canvas height
-      const FONT_HEIGHT_UNITS = 12000;
+      const retouchBaselineY = W * 0.75; // Exactly 75% of the canvas height (avoids descender clipping)
+      const FONT_HEIGHT_UNITS = 13500;
       const verticalScale = retouchBaselineY / FONT_HEIGHT_UNITS;
 
       for (const contour of glyph.paths) {
         let first = true;
+        const leftMargin = (W - glyph.width * verticalScale) / 2;
         for (const pt of contour) {
-          // Inverse transform back into dynamic canvas space (Y goes down, centered horizontally with sidebearings)
-          // X: scale [0, glyph.width] with elegant 10% side padding
-          const cx = (W * 0.1) + pt.x! * ((W * 0.8) / (glyph.width || 1));
+          // Inverse transform using mathematically correct uniform scaling with original proportions
+          const cx = leftMargin + pt.x! * verticalScale;
 
           // Y:
           const cy = retouchBaselineY - pt.y! * verticalScale;
@@ -485,7 +512,7 @@ export default function GridScanner({ onGlyphsExtracted, extractedGlyphsCount }:
           } else if (pt.type === 'L') {
             ctx.lineTo(cx, cy);
           } else if (pt.type === 'Q') {
-            const cx1 = (W * 0.1) + pt.x1! * ((W * 0.8) / (glyph.width || 1));
+            const cx1 = leftMargin + pt.x1! * verticalScale;
             const cy1 = retouchBaselineY - pt.y1! * verticalScale;
             ctx.quadraticCurveTo(cx1, cy1, cx, cy);
           } else if (pt.type === 'Z') {
@@ -734,34 +761,32 @@ export default function GridScanner({ onGlyphsExtracted, extractedGlyphsCount }:
                       setSelectedGlyphIndex(idx);
                       setRetouchMode('none');
                     }}
-                    className={`aspect-square border p-1 rounded-xl flex flex-col justify-between transition-all outline-none focus:ring-2 focus:ring-emerald-500 bg-slate-50/50 hover:bg-slate-50 ${
+                    title={`Символ: ${g.char}${!hasPaths ? ' (Пусто)' : ''}`}
+                    className={`aspect-square border rounded-2xl flex items-center justify-center transition-all p-2 outline-none focus:ring-2 focus:ring-emerald-500 bg-white hover:bg-slate-50 relative ${
                       selectedGlyphIndex === idx
-                        ? 'border-emerald-500 bg-emerald-50/20 shadow-sm'
-                        : hasPaths ? 'border-slate-200' : 'border-dashed border-slate-200 opacity-60'
+                        ? 'border-emerald-500 bg-emerald-50/20 shadow-sm ring-1 ring-emerald-500'
+                        : hasPaths 
+                          ? 'border-slate-200 shadow-sm' 
+                          : 'border-dashed border-slate-200 bg-slate-50/20 opacity-40'
                     }`}
                   >
-                    <span className="text-[10px] font-bold text-slate-400 select-none px-1">{g.char}</span>
-                    <div className="flex-1 flex items-center justify-center min-h-0">
-                      {hasPaths ? (
-                        <svg className="w-10 h-10 text-slate-800" viewBox={`0 -12500 ${g.width || 12000} 16500`}>
-                          <g transform="scale(1, -1)">
-                            <path
-                              d={g.paths.map((pts) => pts.map((pt, i) => {
-                                if (pt.type === 'M' || i === 0) return `M ${pt.x} ${pt.y}`;
-                                if (pt.type === 'L') return `L ${pt.x} ${pt.y}`;
-                                if (pt.type === 'Q') return `Q ${pt.x1} ${pt.y1} ${pt.x} ${pt.y}`;
-                                if (pt.type === 'Z') return 'Z';
-                                return '';
-                              }).join(' ')).join(' ')}
-                              fill="currentColor"
-                              fillRule="evenodd"
-                            />
-                          </g>
-                        </svg>
-                      ) : (
-                        <span className="text-zinc-300 text-xs font-mono">пусто</span>
-                      )}
-                    </div>
+                    {hasPaths ? (
+                      <svg className="w-12 h-12 text-slate-800" viewBox={`0 -10000 ${g.width || 12000} 14000`}>
+                        <g transform="scale(1, -1)">
+                          <path
+                            d={g.paths.map((pts) => pts.map((pt, i) => {
+                              if (pt.type === 'M' || i === 0) return `M ${pt.x} ${pt.y}`;
+                              if (pt.type === 'L') return `L ${pt.x} ${pt.y}`;
+                              if (pt.type === 'Q') return `Q ${pt.x1} ${pt.y1} ${pt.x} ${pt.y}`;
+                              if (pt.type === 'Z') return 'Z';
+                              return '';
+                            }).join(' ')).join(' ')}
+                            fill="currentColor"
+                            fillRule="evenodd"
+                          />
+                        </g>
+                      </svg>
+                    ) : null}
                   </button>
                 );
               })}
@@ -796,12 +821,16 @@ export default function GridScanner({ onGlyphsExtracted, extractedGlyphsCount }:
                     {/* Guidelines overlays */}
                     <div className="absolute inset-0 w-64 h-64 mx-auto pointer-events-none border border-slate-200 rounded-xl">
                       {/* Baseline */}
-                      <div className="absolute top-[85%] left-0 w-full border-t border-dashed border-red-300/60 flex items-center justify-end px-1.5">
+                      <div className="absolute top-[75%] left-0 w-full border-t border-dashed border-red-300/60 flex items-center justify-end px-1.5">
                         <span className="text-[7px] text-red-400 font-mono select-none">Base</span>
                       </div>
                       {/* lowercase height */}
                       {getGlyphAlignment(activeGlyph.char).type === 'standard' && (
-                        <div className="absolute top-[40%] left-0 w-full border-t border-dashed border-blue-300/40"></div>
+                        <div className="absolute top-[40.5%] left-0 w-full border-t border-dashed border-blue-300/40"></div>
+                      )}
+                      {/* tall height */}
+                      {getGlyphAlignment(activeGlyph.char).type === 'tall' && (
+                        <div className="absolute top-[24%] left-0 w-full border-t border-dashed border-blue-300/40"></div>
                       )}
                     </div>
                   </div>
@@ -962,31 +991,28 @@ export default function GridScanner({ onGlyphsExtracted, extractedGlyphsCount }:
                 {scannedGlyphs.map((g, idx) => {
                   const hasPaths = g.paths.length > 0;
                   return (
-                    <div key={idx} className="border border-slate-200 p-2.5 rounded-xl flex flex-col items-center justify-between aspect-square bg-slate-50/20">
-                      <span className="text-[10px] font-mono select-none px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 font-bold leading-none">
-                        {g.char}
-                      </span>
-                      <div className="flex-1 flex items-center justify-center w-full min-h-0 scale-75">
-                        {hasPaths ? (
-                          <svg className="w-12 h-12 text-slate-800" viewBox={`0 -12500 ${g.width || 12000} 16500`}>
-                            <g transform="scale(1, -1)">
-                              <path
-                                d={g.paths.map((pts) => pts.map((pt, i) => {
-                                  if (pt.type === 'M' || i === 0) return `M ${pt.x} ${pt.y}`;
-                                  if (pt.type === 'L') return `L ${pt.x} ${pt.y}`;
-                                  if (pt.type === 'Q') return `Q ${pt.x1} ${pt.y1} ${pt.x} ${pt.y}`;
-                                  if (pt.type === 'Z') return 'Z';
-                                  return '';
-                                }).join(' ')).join(' ')}
-                                fill="currentColor"
-                                fillRule="evenodd"
-                              />
-                            </g>
-                          </svg>
-                        ) : (
-                          <span className="text-slate-300 text-[10px] font-mono leading-none">ПУСТО</span>
-                        )}
-                      </div>
+                    <div 
+                      key={idx} 
+                      title={`Символ: ${g.char}${!hasPaths ? ' (Пусто)' : ''}`}
+                      className="border border-slate-200 rounded-xl flex items-center justify-center aspect-square bg-slate-50/10 p-2 relative"
+                    >
+                      {hasPaths ? (
+                        <svg className="w-12 h-12 text-slate-800" viewBox={`0 -10000 ${g.width || 12000} 14000`}>
+                          <g transform="scale(1, -1)">
+                            <path
+                              d={g.paths.map((pts) => pts.map((pt, i) => {
+                                if (pt.type === 'M' || i === 0) return `M ${pt.x} ${pt.y}`;
+                                if (pt.type === 'L') return `L ${pt.x} ${pt.y}`;
+                                if (pt.type === 'Q') return `Q ${pt.x1} ${pt.y1} ${pt.x} ${pt.y}`;
+                                if (pt.type === 'Z') return 'Z';
+                                return '';
+                              }).join(' ')).join(' ')}
+                              fill="currentColor"
+                              fillRule="evenodd"
+                            />
+                          </g>
+                        </svg>
+                      ) : null}
                     </div>
                   );
                 })}
@@ -1013,33 +1039,26 @@ export default function GridScanner({ onGlyphsExtracted, extractedGlyphsCount }:
               return (
                 <div
                   key={idx}
-                  className="border-2 border-slate-200 p-4 rounded-2xl flex flex-col items-center justify-between aspect-square bg-slate-50/10 break-inside-avoid"
+                  title={`Символ: ${g.char}${!hasPaths ? ' (Пусто)' : ''}`}
+                  className="border-2 border-slate-200 rounded-2xl flex items-center justify-center aspect-square bg-slate-50/10 p-4 break-inside-avoid relative"
                 >
-                  <span className="text-[11px] font-mono select-none px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 font-black mb-1">
-                    {g.char}
-                  </span>
-                  
-                  <div className="flex-1 flex items-center justify-center w-full min-h-0">
-                    {hasPaths ? (
-                      <svg className="w-20 h-20 text-slate-900" viewBox={`0 -12500 ${g.width || 12000} 16500`}>
-                        <g transform="scale(1, -1)">
-                          <path
-                            d={g.paths.map((pts) => pts.map((pt, i) => {
-                              if (pt.type === 'M' || i === 0) return `M ${pt.x} ${pt.y}`;
-                              if (pt.type === 'L') return `L ${pt.x} ${pt.y}`;
-                              if (pt.type === 'Q') return `Q ${pt.x1} ${pt.y1} ${pt.x} ${pt.y}`;
-                              if (pt.type === 'Z') return 'Z';
-                              return '';
-                            }).join(' ')).join(' ')}
-                            fill="currentColor"
-                            fillRule="evenodd"
-                          />
-                        </g>
-                      </svg>
-                    ) : (
-                      <span className="text-slate-300 text-xs font-mono uppercase">Пусто</span>
-                    )}
-                  </div>
+                  {hasPaths ? (
+                    <svg className="w-20 h-20 text-slate-900" viewBox={`0 -10000 ${g.width || 12000} 14000`}>
+                      <g transform="scale(1, -1)">
+                        <path
+                          d={g.paths.map((pts) => pts.map((pt, i) => {
+                            if (pt.type === 'M' || i === 0) return `M ${pt.x} ${pt.y}`;
+                            if (pt.type === 'L') return `L ${pt.x} ${pt.y}`;
+                            if (pt.type === 'Q') return `Q ${pt.x1} ${pt.y1} ${pt.x} ${pt.y}`;
+                            if (pt.type === 'Z') return 'Z';
+                            return '';
+                          }).join(' ')).join(' ')}
+                          fill="currentColor"
+                          fillRule="evenodd"
+                        />
+                      </g>
+                    </svg>
+                  ) : null}
                 </div>
               );
             })}

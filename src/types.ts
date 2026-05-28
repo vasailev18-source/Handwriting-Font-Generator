@@ -52,3 +52,18 @@ export interface FontConfig {
   ascender: number;
   descender: number;
 }
+
+// Layer architecture to separate UI guides, editing markers, and clean vector shapes
+export type RenderLayerType = 'UI' | 'EDITING' | 'FINAL_RENDER';
+
+export interface RenderLayer {
+  type: RenderLayerType;
+  visible: boolean;
+  opacity: number;
+}
+
+export interface RenderPipelineData {
+  layers: Record<RenderLayerType, RenderLayer>;
+  activeLayer: RenderLayerType;
+}
+
