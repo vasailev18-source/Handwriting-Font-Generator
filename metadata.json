@@ -1,0 +1,6 @@
+{
+  "name": "Handwriting Font Generator",
+  "description": "Генератор шрифтов TrueType (.ttf) на основе загруженного бланка или прямого рисования букв в браузере с интерактивной песочницей.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
