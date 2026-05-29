@@ -82,17 +82,13 @@ export function getBinaryGrid(
   const imgData = ctx.getImageData(0, 0, width, height);
   const data = imgData.data;
 
-  // Robust outer margin clearing (12.5%) to completely delete physical table grid borders
-  // This leaves the interior of the cell fully intact and pristine
-  const clearTop = Math.round(height * 0.125);
-  const clearBottom = Math.round(height * 0.125);
-  const clearLeft = Math.round(width * 0.125);
-  const clearRight = Math.round(width * 0.125);
+  // 1. Инициализация бинарной сетки и поиск габаритов всех чернил
+  const grid: boolean[][] = Array(height).fill(null).map(() => Array(width).fill(false));
+  let minXAll = Infinity, maxXAll = -Infinity;
+  let minYAll = Infinity, maxYAll = -Infinity;
+  let hasAnyInk = false;
 
-  // 2D grid
-  const grid: boolean[][] = [];
   for (let y = 0; y < height; y++) {
-    const row: boolean[] = [];
     for (let x = 0; x < width; x++) {
       const idx = (y * width + x) * 4;
       const r = data[idx];
@@ -100,24 +96,176 @@ export function getBinaryGrid(
       const b = data[idx + 2];
       const a = data[idx + 3];
 
-      // Greyscale calculation
+      // Вычисление яркости в градациях серого
       const ref = 0.299 * r + 0.587 * g + 0.114 * b;
       
-      const isNearBorder = clearMargins && (
-        y < clearTop ||
-        y >= height - clearBottom ||
-        x < clearLeft ||
-        x >= width - clearRight
-      );
-
-      // White/transparent is background, dark is ink
-      const isInk = !isNearBorder && a > 50 && ref < threshold;
-      row.push(isInk);
+      // Определение чернил (темные пиксели с достаточной прозрачностью)
+      const isInk = a > 50 && ref < threshold;
+      if (isInk) {
+        grid[y][x] = true;
+        if (x < minXAll) minXAll = x;
+        if (x > maxXAll) maxXAll = x;
+        if (y < minYAll) minYAll = y;
+        if (y > maxYAll) maxYAll = y;
+        hasAnyInk = true;
+      }
     }
-    grid.push(row);
   }
 
-  return { data: grid, width, height };
+  if (!hasAnyInk) {
+    return { data: grid, width, height };
+  }
+
+  // Расчет физических размеров ячейки по контурным границам чернил
+  const cellW = width;
+  const cellH = height;
+
+  // Динамическая Безопасная Зона разметки (Dynamic Central Safe Zone)
+  // Верхняя граница 22% полностью скрывает печатные буквы-подсказки (например, "А")
+  // Боковые и нижняя границы отсекают любые остаточные линии рамок
+  const safeMinX = cellW * 0.10;
+  const safeMaxX = cellW * 0.90;
+  const safeMinY = cellH * 0.22;
+  const safeMaxY = cellH * 0.90;
+
+  // 2. Алгоритм разметки связных областей (Connected Component Labeling - CCL) через итеративный BFS
+  const visited = Array(height).fill(null).map(() => Array(width).fill(false));
+  const components: {
+    minX: number;
+    maxX: number;
+    minY: number;
+    maxY: number;
+    pixels: { x: number; y: number }[];
+  }[] = [];
+
+  // 8-связное перемещение (Moore neighborhood offsets)
+  const dx = [0, 1, 1, 1, 0, -1, -1, -1];
+  const dy = [-1, -1, 0, 1, 1, 1, 0, -1];
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (grid[y][x] && !visited[y][x]) {
+        // Найдена новая компонента
+        const compPixels: { x: number; y: number }[] = [];
+        let compMinX = x, compMaxX = x;
+        let compMinY = y, compMaxY = y;
+
+        const queue: number[] = [x, y];
+        visited[y][x] = true;
+        let head = 0;
+
+        while (head < queue.length) {
+          const qx = queue[head++];
+          const qy = queue[head++];
+          compPixels.push({ x: qx, y: qy });
+
+          if (qx < compMinX) compMinX = qx;
+          if (qx > compMaxX) compMaxX = qx;
+          if (qy < compMinY) compMinY = qy;
+          if (qy > compMaxY) compMaxY = qy;
+
+          for (let i = 0; i < 8; i++) {
+            const nx = qx + dx[i];
+            const ny = qy + dy[i];
+
+            if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+              if (grid[ny][nx] && !visited[ny][nx]) {
+                visited[ny][nx] = true;
+                queue.push(nx, ny);
+              }
+            }
+          }
+        }
+
+        components.push({
+          minX: compMinX,
+          maxX: compMaxX,
+          minY: compMinY,
+          maxY: compMaxY,
+          pixels: compPixels
+        });
+      }
+    }
+  }
+
+  // 3. Классификация компонент и умная чистка (Умный Padding + Защита от обрезания хвостиков)
+  const finalGrid = Array(height).fill(null).map(() => Array(width).fill(false));
+
+  for (const comp of components) {
+    const compW = comp.maxX - comp.minX;
+    const compH = comp.maxY - comp.minY;
+    const compSize = comp.pixels.length;
+
+    // Распознавание линий сетки таблицы (очень длинные и тонкие компоненты)
+    const isHorizontalBorder = compW > cellW * 0.94 && compH < cellH * 0.10;
+    const isVerticalBorder = compH > cellH * 0.94 && compW < cellW * 0.10;
+    const isBorderLine = isHorizontalBorder || isVerticalBorder;
+
+    // Исключение аномально гигантских перекрытий
+    const isTooBig = compW > cellW * 0.97 || compH > cellH * 0.97;
+
+    // Проверка пересечения с Центральной Безопасной Зоной черчения
+    const overlapX = comp.minX <= safeMaxX && comp.maxX >= safeMinX;
+    const overlapY = comp.minY <= safeMaxY && comp.maxY >= safeMinY;
+    const overlapsSafeZone = overlapX && overlapY;
+
+    // Исключение печатного текста: игнорируем печатные буквы-подсказки в верхней части трафарета
+    const isPrintedHint = comp.maxY < cellH * 0.35 && comp.maxX < cellW * 0.40 && compW < cellW * 0.20 && compH < cellH * 0.20;
+
+    // Отсечение одиночного фонового шума
+    const isNoise = compSize < 4;
+
+    // Символ сохраняется целиком, если хотя бы частично пересекает безопасную зону
+    // Это автоматически сохраняет длинные штрихи ("хвостики") букв вне безопасной зоны!
+    const shouldKeep = overlapsSafeZone && !isBorderLine && !isTooBig && !isNoise && !isPrintedHint;
+
+    if (shouldKeep) {
+      for (const p of comp.pixels) {
+        finalGrid[p.y][p.x] = true;
+      }
+    }
+  }
+
+  // 4. Локализация точного бокса вырезания с отступом в -1/+1 пиксель
+  let minY = -1, maxY = -1, minX = -1, maxX = -1;
+  let hasInk = false;
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (finalGrid[y][x]) {
+        if (!hasInk) {
+          minY = y;
+          maxY = y;
+          minX = x;
+          maxX = x;
+          hasInk = true;
+        } else {
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+        }
+      }
+    }
+  }
+
+  const resultGrid = Array(height).fill(null).map(() => Array(width).fill(false));
+
+  if (hasInk) {
+    // Точный отступ с защитой от выхода за границы массива
+    const yMinBound = Math.max(0, minY - 1);
+    const yMaxBound = Math.min(height - 1, maxY + 1);
+    const xMinBound = Math.max(0, minX - 1);
+    const xMaxBound = Math.min(width - 1, maxX + 1);
+
+    for (let y = yMinBound; y <= yMaxBound; y++) {
+      for (let x = xMinBound; x <= xMaxBound; x++) {
+        resultGrid[y][x] = finalGrid[y][x];
+      }
+    }
+  }
+
+  return { data: resultGrid, width, height };
 }
 
 // Simple Ramer-Douglas-Peucker (RDP) path simplification algorithm
@@ -158,133 +306,135 @@ function perpendicularDistance(p: Point, lineStart: Point, lineEnd: Point): numb
   return num / den;
 }
 
-// Moore-Neighbor Contour Tracing algorithm
+// Marching Squares Contour Tracing algorithm
 export function traceContours(grid: boolean[][], width: number, height: number): Point[][] {
-  const visited = Array(height).fill(null).map(() => Array(width).fill(false));
-  const contours: Point[][] = [];
+  const segments: { p1: Point; p2: Point }[] = [];
 
-  // Moore 8-neighbors navigation index
-  const dx = [0, 1, 1, 1, 0, -1, -1, -1];
-  const dy = [-1, -1, 0, 1, 1, 1, 0, -1];
+  // Iterate over all 2x2 blocks (corners)
+  for (let y = 0; y <= height; y++) {
+    for (let x = 0; x <= width; x++) {
+      const tl = (x > 0 && y > 0 && grid[y - 1][x - 1]) ? 1 : 0;
+      const tr = (x < width && y > 0 && grid[y - 1][x]) ? 1 : 0;
+      const br = (x < width && y < height && grid[y][x]) ? 1 : 0;
+      const bl = (x > 0 && y < height && grid[y][x - 1]) ? 1 : 0;
 
-  for (let y = 1; y < height - 1; y++) {
-    for (let x = 1; x < width - 1; x++) {
-      // Find an unvisited black pixel that represents a boundary
-      if (grid[y][x] && !visited[y][x]) {
-        // Simple check to make sure it's an edge pixel of some shape
-        let hasWhiteNeighbor = false;
-        for (let i = 0; i < 8; i++) {
-          if (!grid[y + dy[i]][x + dx[i]]) {
-            hasWhiteNeighbor = true;
-            break;
-          }
-        }
+      const state = (tl << 3) | (tr << 2) | (br << 1) | bl;
+      if (state === 0 || state === 15) continue;
+      
+      const top = { x: x, y: y - 0.5 };
+      const right = { x: x + 0.5, y: y };
+      const bottom = { x: x, y: y + 0.5 };
+      const left = { x: x - 0.5, y: y };
 
-        if (hasWhiteNeighbor) {
-          const contour = traceSingleContour(grid, x, y, visited, dx, dy, width, height);
-          if (contour.length > 4) {
-            contours.push(contour);
-          }
-        }
+      switch (state) {
+        case 1: segments.push({ p1: left, p2: bottom }); break;
+        case 2: segments.push({ p1: bottom, p2: right }); break;
+        case 3: segments.push({ p1: left, p2: right }); break;
+        case 4: segments.push({ p1: right, p2: top }); break;
+        case 5: segments.push({ p1: left, p2: bottom }, { p1: right, p2: top }); break;
+        case 6: segments.push({ p1: bottom, p2: top }); break;
+        case 7: segments.push({ p1: left, p2: top }); break;
+        case 8: segments.push({ p1: top, p2: left }); break;
+        case 9: segments.push({ p1: top, p2: bottom }); break;
+        case 10: segments.push({ p1: top, p2: left }, { p1: bottom, p2: right }); break;
+        case 11: segments.push({ p1: top, p2: right }); break;
+        case 12: segments.push({ p1: right, p2: left }); break;
+        case 13: segments.push({ p1: right, p2: bottom }); break;
+        case 14: segments.push({ p1: bottom, p2: left }); break;
       }
+    }
+  }
+
+  const contours: Point[][] = [];
+  const adj = new Map<string, Point[]>();
+  
+  for (const seg of segments) {
+    const k = `${seg.p1.x},${seg.p1.y}`;
+    if (!adj.has(k)) adj.set(k, []);
+    adj.get(k)!.push(seg.p2);
+  }
+
+  while (adj.size > 0) {
+    const iterator = adj.keys().next();
+    if (iterator.done) break;
+    const firstKey = iterator.value;
+    
+    const parts = firstKey.split(',');
+    const startPt = { x: parseFloat(parts[0]), y: parseFloat(parts[1]) };
+    
+    const currentContour: Point[] = [startPt];
+    let currKey = firstKey;
+    
+    while (true) {
+      const list = adj.get(currKey);
+      if (!list || list.length === 0) {
+        adj.delete(currKey);
+        break;
+      }
+      
+      const nextPt = list.pop()!;
+      if (list.length === 0) {
+        adj.delete(currKey);
+      }
+      
+      currentContour.push(nextPt);
+      currKey = `${nextPt.x},${nextPt.y}`;
+      
+      if (nextPt.x === startPt.x && nextPt.y === startPt.y) {
+        break;
+      }
+    }
+    
+    if (currentContour.length > 4) {
+      contours.push(currentContour);
     }
   }
 
   return contours;
 }
 
-function traceSingleContour(
-  grid: boolean[][],
-  startX: number,
-  startY: number,
-  visited: boolean[][],
-  dx: number[],
-  dy: number[],
-  width: number,
-  height: number
-): Point[] {
-  const contour: Point[] = [];
-  let cx = startX;
-  let cy = startY;
-
-  // Let's find the initial entry direction from a white neighbor
-  let dir = 0; // Starts from North (0)
-  for (let i = 0; i < 8; i++) {
-    const nx = cx + dx[i];
-    const ny = cy + dy[i];
-    if (nx >= 0 && nx < width && ny >= 0 && ny < height && !grid[ny][nx]) {
-      dir = i;
-      break;
-    }
-  }
-
-  let backtrackCount = 0;
-  const maxSteps = width * height * 2; // Safeguard
-
-  do {
-    visited[cy][cx] = true;
-    contour.push({ x: cx, y: cy });
-
-    // Look around using Moore neighborhood clockwise starting from the previous search point
-    let found = false;
-    // Enter search from direction of previous backtrack
-    let searchIndex = (dir + 5) % 8; // standard backtrack step
-
-    for (let i = 0; i < 8; i++) {
-      const idx = (searchIndex + i) % 8;
-      const nx = cx + dx[idx];
-      const ny = cy + dy[idx];
-
-      if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-        if (grid[ny][nx]) {
-          cx = nx;
-          cy = ny;
-          dir = idx;
-          found = true;
-          break;
-        }
-      }
-    }
-
-    if (!found) {
-      break; // Single isolated pixel or loop finished
-    }
-
-    backtrackCount++;
-    if (backtrackCount > maxSteps) {
-      break; // Infinite safety loop check
-    }
-
-  } while (!(cx === startX && cy === startY));
-
-  return contour;
-}
-
 // Letter classification for high-quality font alignment
 export function getGlyphAlignment(char: string): {
-  type: 'tall' | 'standard' | 'descender' | 'punctuation';
+  type: string;
   yMin: number; // Baseline-relative bottom boundary (TTF units)
   yMax: number; // Baseline-relative top boundary (TTF units)
 } {
-  // Uppercase Cyrillic & Latin, digits, plus tall lowercase & brackets
-  const tallChars = 'АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789бďfghjklt()[]{}';
-  // Lowercase Cyrillic with descenders: д, з, у, ф, р and Latin descenders: g, j, p, q, y
-  const descenders = 'дзуфрgjpqyрp'; // Includes both Cyrillic and Latin versions
-  // Small punctuation symbols
-  const punctuation = '.,-+=_!?;()[]{}<>:;\'"';
+  // 1. Прописные (Большие) с верхними выносными элементами (диакритика)
+  const capAscenders = 'ЙЁ';
+  // 2. Прописные (Большие) с нижними выносными элементами (хвостики)
+  const capDescenders = 'ДЦЩ';
+  // 3. Прописные (Большие) стандартные
+  const caps = 'АБВГЕЖЗИКЛМНОПРСТУФХЧШЪЫЬЭЮЯABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  
+  // 4. Строчные (Маленькие) с верхними выносными элементами (хвостик б, диакритика ё, й)
+  const lowerAscenders = 'бёйbdfhklit';
+  // 5. Строчные (Маленькие) с нижними выносными элементами
+  const lowerDescenders = 'дцущрфgjpqy';
+  // 6. Строчные стандартные
+  const lowers = 'авгежзиклмнопстхчшъыьэюяacemnorsuvwxz';
+  // Знаки препинания
+  const punctuation = '.,-+=_!?;()[]{}<>:;\\\'"';
 
-  if (tallChars.includes(char)) {
-    return { type: 'tall', yMin: 0, yMax: 9200 };
-  } else if (descenders.includes(char)) {
-    return { type: 'descender', yMin: -2800, yMax: 6200 };
+  if (capAscenders.includes(char)) {
+    return { type: 'cap_ascender', yMin: 0, yMax: 9200 };
+  } else if (capDescenders.includes(char)) {
+    return { type: 'cap_descender', yMin: -2800, yMax: 8200 };
+  } else if (caps.includes(char)) {
+    return { type: 'cap', yMin: 0, yMax: 8200 };
+  } else if (lowerAscenders.includes(char)) {
+    return { type: 'lower_ascender', yMin: 0, yMax: 8200 };
+  } else if (lowerDescenders.includes(char)) {
+    return { type: 'lower_descender', yMin: -2800, yMax: 5500 };
+  } else if (lowers.includes(char)) {
+    return { type: 'lower', yMin: 0, yMax: 5500 };
   } else if (punctuation.includes(char)) {
     if (char === '.' || char === ',') {
       return { type: 'punctuation', yMin: 0, yMax: 2000 };
     }
-    return { type: 'punctuation', yMin: 0, yMax: 6200 };
+    return { type: 'punctuation', yMin: 0, yMax: 8200 };
   } else {
-    // Normal lowercase (а, в, г, е, ж, з, и, й, к, л, м, н, о, п, р, с, т, х, ц, ч, ш, щ, ъ, ы, ь, э, ю, я, etc.)
-    return { type: 'standard', yMin: 0, yMax: 6200 };
+    // Default fallback
+    return { type: 'standard', yMin: 0, yMax: 5500 };
   }
 }
 
@@ -683,18 +833,32 @@ export function createFontPaths(
     return { paths: [], advanceWidth: 5734 };
   }
 
+  // Pre-calculate filter results for each contour
+  const isLikelyBox = contours.map(contour => isLikelyTableLineOrBoxSymbol(
+    contour,
+    imgWidth,
+    imgHeight,
+    char,
+    destX,
+    destY,
+    destW,
+    destH
+  ));
+
   // STRICT LAYER SEPARATION: Isolate handwriting contours only (Layer 3)
-  const filteredContours = contours.filter(contour => {
-    return !isLikelyTableLineOrBoxSymbol(
-      contour,
-      imgWidth,
-      imgHeight,
-      char,
-      destX,
-      destY,
-      destW,
-      destH
-    );
+  // We keep a contour if it is NOT a box symbol, OR if it is completely inside a contour that is kept.
+  const filteredContours = contours.filter((contour, i) => {
+    if (!isLikelyBox[i]) return true;
+
+    // Wait, if it WAS detected as a box/line, but it's an inner hole of a VALID contour, we keep it!
+    for (let j = 0; j < contours.length; j++) {
+      if (i !== j && !isLikelyBox[j]) {
+        if (isPointInPolygon(contour[0], contours[j])) {
+          return true; // Keep inner holes
+        }
+      }
+    }
+    return false;
   });
 
   if (filteredContours.length === 0) {
@@ -736,11 +900,24 @@ export function createFontPaths(
   const centroidX = totalPts > 0 ? (sumX / totalPts) : (minX + maxX) / 2;
   const centroidY = totalPts > 0 ? (sumY / totalPts) : (minY + maxY) / 2;
 
-  const boxW = (maxX - minX) > 0 ? (maxX - minX) : 1;
-  const boxH = (maxY - minY) > 0 ? (maxY - minY) : 1;
+  let boxW = (maxX - minX) > 0 ? (maxX - minX) : 1;
+  let boxH = (maxY - minY) > 0 ? (maxY - minY) : 1;
 
   // 3. Setup uniform scaling and baseline factors
   const align = getGlyphAlignment(char);
+
+  // Безопасные отступы: +15% к координатам границ для букв с выносными элементами (хвостами сверху/снизу)
+  if (align.type.includes('ascender') || align.type.includes('descender')) {
+    const padY = boxH * 0.15;
+    const padX = boxW * 0.15;
+    minY -= padY;
+    maxY += padY;
+    minX -= padX;
+    maxX += padX;
+    boxH = (maxY - minY) > 0 ? (maxY - minY) : 1;
+    boxW = (maxX - minX) > 0 ? (maxX - minX) : 1;
+  }
+
   const targetHeight = align.yMax - align.yMin;
 
   // Uniform aspect-ratio Auto-Fit
@@ -799,8 +976,15 @@ export function createFontPaths(
   // 6. Project and smooth all points using our validated fit parameters
   const transformedContours: Point[][] = [];
   for (const contour of filteredContours) {
-    const smoothed = smoothContour(smoothContour(smoothContour(contour)));
-    const simplified = simplifyContour(smoothed, 0.0001); // ultra-high polygon fidelity
+    let smoothed = contour;
+    // Применяем 12 проходов сглаживания (фильтр Безье/Гаусса), чтобы полностью устранить пиксельную лесенку
+    // и создать идеально плавный шлейф эффекта настоящей чернильной ручки.
+    for (let k = 0; k < 12; k++) {
+      smoothed = smoothContour(smoothed);
+    }
+    // Увеличиваем epsilon до 2.0. Это устраняет зернистость алгоритма Рамера-Дугласа-Пекера (RDP), 
+    // убирая сверхмалые изломы и вписывая длинные участки в идеальные полиномиальные кривые Безье.
+    const simplified = simplifyContour(smoothed, 2.0); 
     if (simplified.length < 3) continue;
 
     const ptsInTtf: Point[] = [];
@@ -903,4 +1087,3 @@ export function createFontPaths(
 function half(val: number) {
   return val / 2;
 }
-

@@ -269,37 +269,124 @@ export default function GridScanner({ onGlyphsExtracted, extractedGlyphsCount }:
       const cellW = targetW / activeTemplate.cols;
       const cellH = targetH / activeTemplate.rows;
 
-      // Draw white lines directly over all grid cell boundaries on warpedCanvas to cleanly delete physical table borders.
-      // This leaves the interior of every cell completely original and guarantees letters are never clipped.
       const warpedCtx = warpedCanvas.getContext('2d');
-      if (warpedCtx) {
-        warpedCtx.strokeStyle = 'white';
-        
-        // Erase vertical grid lines centered at col * cellW (2% cellW width easily clears modern borders without clipping)
-        warpedCtx.lineWidth = Math.max(2, Math.round(cellW * 0.02));
-        for (let c = 0; c <= activeTemplate.cols; c++) {
-          const x = c * cellW;
-          warpedCtx.beginPath();
-          warpedCtx.moveTo(x, 0);
-          warpedCtx.lineTo(x, targetH);
-          warpedCtx.stroke();
-        }
+      if (!warpedCtx) throw new Error('Could not get warped canvas context');
 
-        // Erase horizontal grid lines centered at row * cellH (2% cellH width)
-        warpedCtx.lineWidth = Math.max(2, Math.round(cellH * 0.02));
-        for (let r = 0; r <= activeTemplate.rows; r++) {
-          const y = r * cellH;
-          warpedCtx.beginPath();
-          warpedCtx.moveTo(0, y);
-          warpedCtx.lineTo(targetW, y);
-          warpedCtx.stroke();
+      // --- ДИНАМИЧЕСКАЯ АДАПТАЦИЯ СЕТКИ (ADAPTIVE GRID LINE DETECTION) ---
+      // Поиск горизонтальных и вертикальных линий разметки по профилю вертикальной проекции.
+      // Для исключения влияния рисунков букв мы берем тонкие полосы без символов 
+      // (например, центр листа для горизонтальных линий, и горизонтальный центр для вертикальных).
+      const detectedY: number[] = new Array(activeTemplate.rows + 1);
+      detectedY[0] = 0;
+      detectedY[activeTemplate.rows] = targetH;
+
+      try {
+        const stripW = 200;
+        const stripXStart = Math.round((targetW - stripW) / 2);
+        const stripDataY = warpedCtx.getImageData(stripXStart, 0, stripW, targetH);
+        const pixelsY = stripDataY.data;
+
+        for (let r = 1; r < activeTemplate.rows; r++) {
+          const expectedY = r * cellH;
+          // Окно локального поиска горизонтальной линии ±9% от высоты ячейки
+          const searchRange = Math.round(cellH * 0.09);
+          const yStart = Math.round(expectedY - searchRange);
+          const yEnd = Math.round(expectedY + searchRange);
+
+          let bestY = Math.round(expectedY);
+          let minIntensity = Infinity;
+
+          for (let y = yStart; y <= yEnd; y++) {
+            if (y < 0 || y >= targetH) continue;
+            let sumRef = 0;
+            for (let sx = 0; sx < stripW; sx++) {
+              const idx = (y * stripW + sx) * 4;
+              const ref = 0.299 * pixelsY[idx] + 0.587 * pixelsY[idx + 1] + 0.114 * pixelsY[idx + 2];
+              sumRef += ref;
+            }
+            if (sumRef < minIntensity) {
+              minIntensity = sumRef;
+              bestY = y;
+            }
+          }
+          detectedY[r] = bestY;
+        }
+      } catch (e) {
+        console.warn('Ошибка локального поиска строк. Откат к жесткой разметке.', e);
+        for (let r = 1; r < activeTemplate.rows; r++) {
+          detectedY[r] = r * cellH;
         }
       }
 
-      // 3. Loop through template cells to slice and parse letters
+      const detectedX: number[] = new Array(activeTemplate.cols + 1);
+      detectedX[0] = 0;
+      detectedX[activeTemplate.cols] = targetW;
+
+      try {
+        const stripH = 200;
+        const stripYStart = Math.round((targetH - stripH) / 2);
+        const stripDataX = warpedCtx.getImageData(0, stripYStart, targetW, stripH);
+        const pixelsX = stripDataX.data;
+
+        for (let c = 1; c < activeTemplate.cols; c++) {
+          const expectedX = c * cellW;
+          // Окно локального поиска вертикальной линии ±9% от ширины ячейки
+          const searchRange = Math.round(cellW * 0.09);
+          const xStart = Math.round(expectedX - searchRange);
+          const xEnd = Math.round(expectedX + searchRange);
+
+          let bestX = Math.round(expectedX);
+          let minIntensity = Infinity;
+
+          for (let x = xStart; x <= xEnd; x++) {
+            if (x < 0 || x >= targetW) continue;
+            let sumRef = 0;
+            for (let sy = 0; sy < stripH; sy++) {
+              const idx = (sy * targetW + x) * 4;
+              const ref = 0.299 * pixelsX[idx] + 0.587 * pixelsX[idx + 1] + 0.114 * pixelsX[idx + 2];
+              sumRef += ref;
+            }
+            if (sumRef < minIntensity) {
+              minIntensity = sumRef;
+              bestX = x;
+            }
+          }
+          detectedX[c] = bestX;
+        }
+      } catch (e) {
+        console.warn('Ошибка локального поиска колонок. Откат к жесткой разметке.', e);
+        for (let c = 1; c < activeTemplate.cols; c++) {
+          detectedX[c] = c * cellW;
+        }
+      }
+
+      // Стираем фактические физические линии сетки поверх деформированного холста белым цветом
+      warpedCtx.strokeStyle = 'white';
+      
+      // Стирание вертикальных разделителей
+      for (let c = 0; c <= activeTemplate.cols; c++) {
+        const x = detectedX[c];
+        warpedCtx.lineWidth = Math.max(5, Math.round(cellW * 0.025));
+        warpedCtx.beginPath();
+        warpedCtx.moveTo(x, 0);
+        warpedCtx.lineTo(x, targetH);
+        warpedCtx.stroke();
+      }
+
+      // Стирание горизонтальных разделителей (предотвращает кумулятивное смещение на нижних строках)
+      for (let r = 0; r <= activeTemplate.rows; r++) {
+        const y = detectedY[r];
+        warpedCtx.lineWidth = Math.max(5, Math.round(cellH * 0.025));
+        warpedCtx.beginPath();
+        warpedCtx.moveTo(0, y);
+        warpedCtx.lineTo(targetW, y);
+        warpedCtx.stroke();
+      }
+
+      // 3. Нарезка ячеек шаблона по динамически определенным координатам
       const extractedGlyphs: GlyphData[] = [];
 
-      // Offscreen canvas for individual cell (2048x2048 hyper-high-resolution block)
+      // Offscreen холст для обработки отдельного символа (блок высокого разрешения 2048x2048)
       const cellCanvas = document.createElement('canvas');
       cellCanvas.width = 2048;
       cellCanvas.height = 2048;
@@ -308,19 +395,15 @@ export default function GridScanner({ onGlyphsExtracted, extractedGlyphsCount }:
       if (!cellCtx) throw new Error('Cell rendering canvas failed');
 
       for (const cell of activeTemplate.cells) {
-        if (cell.isLogo) continue; // Skip Logo blocks
+        if (cell.isLogo) continue; // Пропуск логотипов
 
-        // Cell source rect bounds on the warped canvas
-        const srcX = cell.col * cellW;
-        const srcY = cell.row * cellH;
+        // Использование динамических скорректированных ребер ячейки
+        const srcX = detectedX[cell.col];
+        const srcY = detectedY[cell.row];
+        const srcW_crop = detectedX[cell.col + 1] - srcX;
+        const srcH_crop = detectedY[cell.row + 1] - srcY;
 
-        // Perfect original resolution and aspect ratio (no margins cropped at page slicing level)
-        const marginX = 0;
-        const marginY = 0;
-        const srcW_crop = cellW;
-        const srcH_crop = cellH;
-
-        // Scale and center uniformly so we preserve writing aspect ratios and keep safe margins
+        // Нормализация и центрирование пропорций в пространстве ячейки
         const maxInnerSize = 1960;
         const scale = Math.min(maxInnerSize / srcW_crop, maxInnerSize / srcH_crop);
         const destW = srcW_crop * scale;
