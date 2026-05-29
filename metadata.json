@@ -1,6 +1,6 @@
 {
-  "name": "Handwriting Font Generator",
-  "description": "An advanced vector-based tool to create high-resolution custom handwriting fonts with real-time editing and preview.",
+  "name": "",
+  "description": "",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

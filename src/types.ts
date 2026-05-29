@@ -1,69 +1,73 @@
-export interface Point {
-  x: number;
-  y: number;
-}
+export type InkColor = 'blue' | 'black' | 'red' | 'purple' | 'green' | 'pink' | 'orange' | 'yellow' | 'brown' | 'grey' | 'pencil' | 'felt-blue' | 'felt-pink' | 'marker-yellow';
+export type ToolType = 'pen' | 'felt' | 'pencil' | 'colored-pencil' | 'marker' | 'liner';
+export type PenStyle = 'ballpoint' | 'fountain' | 'gel';
+export type PaperType = 'blank' | 'lined' | 'squared';
 
-export type PathCommandType = 'M' | 'L' | 'Q' | 'C' | 'Z';
-
-export interface PathCommand {
-  type: PathCommandType;
-  x?: number;
-  y?: number;
-  x1?: number;
-  y1?: number;
-  x2?: number;
-  y2?: number;
-}
-
-export interface GlyphData {
-  char: string;
-  paths: PathCommand[][]; // Array of subpaths, each containing list of drawing commands
-  width: number; // Advance width
-}
-
-export interface TemplateCell {
-  label: string;
-  char: string;
-  row: number;
-  col: number;
-  isLogo?: boolean;
-}
-
-export interface TemplatePage {
+export interface HandwritingStyle {
   id: string;
   name: string;
+  creator: string;
   description: string;
-  rows: number;
-  cols: number;
-  cells: TemplateCell[];
+  isCustom?: boolean;
+  slant: number; // base tilt
+  letterSpacing: number; // multiplier
+  baselineOffset: number; // base baseline placement
+  glyphs: Record<string, string>; // character -> list of points/segments encoded as SVG standard paths
+  useFont?: boolean;
+  fontFamily?: string;
+  fontUrl?: string; // custom base64 encoded TTF/OTF data URL or loaded Google Font name
+  isPrinted?: boolean;
 }
 
-export interface DeskewCorners {
-  topLeft: Point;
-  topRight: Point;
-  bottomRight: Point;
-  bottomLeft: Point;
+export interface PageConfig {
+  paperType: PaperType;
+  fontFamily: 'sans' | 'serif';
+  inkColor: InkColor;
+  toolType?: ToolType;
+  penStyle: PenStyle;
+  lineSpacing: number; // pixels (e.g., 28px)
+  letterSpacing: number; // letter offset fine-tuning
+  wordSpacing: number; // space width
+  tiltVariance: number; // random tilt variation offset [-5, 5] degrees
+  spacingVariance: number; // random horizontal spacing noise
+  baselineVariance: number; // wavy baseline, random baseline offset
+  strokeThickness: number; // base width of strokes
+  noiseLevel: number; // jitters coordinate points slightly
+  margins: {
+    top: number;
+    bottom: number;
+    left: number;
+    right: number;
+  };
+  showMargins: boolean;
+  curvedLines: boolean; // line baselines slightly bend/wave like manual typing
+  paperTexture?: 'clean' | 'fiber' | 'copy' | 'vintage'; // Realistic paper styles & scanner filters
+  paperEffect?: 'none' | 'shadow' | 'scanner' | 'crumpled'; // Photoreal scanner effects & camera shadows
+  textOutlineColor?: string; // Custom text outline color (e.g. for highlights/stroke)
 }
 
-export interface FontConfig {
-  familyName: string;
-  styleName: string;
-  unitsPerEm: number;
-  ascender: number;
-  descender: number;
+export interface GenerationHistory {
+  id: string;
+  text: string;
+  styleId: string;
+  date: string;
+  paperType: PaperType;
+  inkColor: InkColor;
 }
 
-// Layer architecture to separate UI guides, editing markers, and clean vector shapes
-export type RenderLayerType = 'UI' | 'EDITING' | 'FINAL_RENDER';
-
-export interface RenderLayer {
-  type: RenderLayerType;
-  visible: boolean;
-  opacity: number;
+export interface TelegramUser {
+  id?: number;
+  first_name?: string;
+  last_name?: string;
+  username?: string;
+  language_code?: string;
 }
 
-export interface RenderPipelineData {
-  layers: Record<RenderLayerType, RenderLayer>;
-  activeLayer: RenderLayerType;
+export interface TelegramTheme {
+  bg_color?: string;
+  text_color?: string;
+  hint_color?: string;
+  link_color?: string;
+  button_color?: string;
+  button_text_color?: string;
 }
-
