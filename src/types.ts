@@ -67,3 +67,36 @@ export interface RenderPipelineData {
   activeLayer: RenderLayerType;
 }
 
+export interface PageConfig {
+  paperType: 'lined' | 'grid' | 'craft' | 'blank';
+  fontFamily: string;
+  inkColor: string;
+  penStyle: string;
+  lineSpacing: number;
+  letterSpacing: number;
+  wordSpacing: number;
+  tiltVariance: number;
+  spacingVariance: number;
+  baselineVariance: number;
+  strokeThickness: number;
+  noiseLevel: number;
+  margins: { top: number; bottom: number; left: number; right: number };
+  showMargins: boolean;
+  curvedLines: boolean;
+}
+
+export interface HandwritingStyle {
+  id: string;
+  name: string;
+  creator?: string;
+  description?: string;
+  slant?: number;
+  letterSpacing?: number;
+  baselineOffset?: number;
+  glyphs?: Record<string, string>;
+  useFont?: boolean;
+  fontFamily?: string;
+  isPrinted?: boolean;
+}
+
+

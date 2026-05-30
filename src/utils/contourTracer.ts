@@ -1,5 +1,27 @@
 import { Point, DeskewCorners, PathCommand } from '../types';
 
+// Forensic Tracer Session State (Shared client-side diagnostics)
+if (typeof window !== 'undefined') {
+  (window as any).__forensic_trace = (window as any).__forensic_trace || {
+    totalCells: 0,
+    totalComponents: 0,
+    totalContours: 0,
+    totalRejectedContours: 0,
+    totalGlyphs: 0,
+    totalCollisions: 0,
+    suspiciousCells: [] as string[],
+    savedImages: {} as Record<string, Record<string, string>>
+  };
+}
+
+let nextContourId = 1;
+export function getNextContourId(): number {
+  return nextContourId++;
+}
+export function resetContourIds(): void {
+  nextContourId = 1;
+}
+
 // Bilinear quad warping: maps normal [0, 1] x [0, 1] back to source image space via 4 corners
 export function warpImage(
   sourceCanvas: HTMLCanvasElement,
@@ -7,13 +29,22 @@ export function warpImage(
   targetWidth: number,
   targetHeight: number
 ): HTMLCanvasElement {
+  console.log(`%c[FORENSIC ENTER] warpImage`, "color: #0891b2; font-weight: bold;");
+  console.log(`Source dimensions: ${sourceCanvas.width}x${sourceCanvas.height}`);
+  console.log(`Target request size: ${targetWidth}x${targetHeight}`);
+  console.log(`Quad corners specification:`, JSON.stringify(corners));
+  const startTime = performance.now();
+
   const targetCanvas = document.createElement('canvas');
   targetCanvas.width = targetWidth;
   targetCanvas.height = targetHeight;
   const targetCtx = targetCanvas.getContext('2d');
   
   const sourceCtx = sourceCanvas.getContext('2d');
-  if (!targetCtx || !sourceCtx) return targetCanvas;
+  if (!targetCtx || !sourceCtx) {
+    console.warn(`%c[FORENSIC EXIT] warpImage: targetCtx or sourceCtx failed`, "color: #0891b2;");
+    return targetCanvas;
+  }
 
   const srcWidth = sourceCanvas.width;
   const srcHeight = sourceCanvas.height;
@@ -63,6 +94,10 @@ export function warpImage(
   }
 
   targetCtx.putImageData(targetData, 0, 0);
+  const endTime = performance.now();
+  console.log(`%c[FORENSIC EXIT] warpImage: complete`, "color: #0891b2; font-weight: bold;");
+  console.log(`Resulting canvas size: ${targetCanvas.width}x${targetCanvas.height}`);
+  console.log(`Warp duration: ${(endTime - startTime).toFixed(2)}ms`);
   return targetCanvas;
 }
 
@@ -72,10 +107,15 @@ export function getBinaryGrid(
   threshold: number,
   clearMargins = false
 ): { data: boolean[][]; width: number; height: number } {
+  console.log(`%c[FORENSIC ENTER] getBinaryGrid`, "color: #7c3aed; font-weight: bold;");
+  console.log(`Canvas size: ${canvas.width}x${canvas.height}, Threshold limit: ${threshold}, Clear margins option: ${clearMargins}`);
+  const startTime = performance.now();
+
   const ctx = canvas.getContext('2d');
   const width = canvas.width;
   const height = canvas.height;
   if (!ctx) {
+    console.warn(`%c[FORENSIC EXIT] getBinaryGrid: Canvas context failed`, "color: #7c3aed;");
     return { data: Array(height).fill(null).map(() => Array(width).fill(false)), width, height };
   }
 
@@ -87,6 +127,8 @@ export function getBinaryGrid(
   let minXAll = Infinity, maxXAll = -Infinity;
   let minYAll = Infinity, maxYAll = -Infinity;
   let hasAnyInk = false;
+  let blackPixelsCount = 0;
+  let whitePixelsCount = 0;
 
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
@@ -103,16 +145,24 @@ export function getBinaryGrid(
       const isInk = a > 50 && ref < threshold;
       if (isInk) {
         grid[y][x] = true;
+        blackPixelsCount++;
         if (x < minXAll) minXAll = x;
         if (x > maxXAll) maxXAll = x;
         if (y < minYAll) minYAll = y;
         if (y > maxYAll) maxYAll = y;
         hasAnyInk = true;
+      } else {
+        whitePixelsCount++;
       }
     }
   }
 
+  const totalPixels = width * height;
+  const fillRatio = blackPixelsCount / totalPixels;
+  console.log(`Binary Grid stats: Total Pixels: ${totalPixels}, Black/Ink count: ${blackPixelsCount}, White count: ${whitePixelsCount}, Ink Fill ratio: ${(fillRatio * 100).toFixed(2)}%`);
+
   if (!hasAnyInk) {
+    console.log(`%c[FORENSIC EXIT] getBinaryGrid: No ink found on canvas`, "color: #7c3aed; font-weight: bold;");
     return { data: grid, width, height };
   }
 
@@ -121,15 +171,15 @@ export function getBinaryGrid(
   const cellH = height;
 
   // Динамическая Безопасная Зона разметки (Dynamic Central Safe Zone)
-  // Верхняя граница 22% полностью скрывает печатные буквы-подсказки (например, "А")
-  // Боковые и нижняя границы отсекают любые остаточные линии рамок
+  // Upper margin of 22% covers printed guidelines/text hints
   const safeMinX = cellW * 0.10;
   const safeMaxX = cellW * 0.90;
   const safeMinY = cellH * 0.22;
   const safeMaxY = cellH * 0.90;
 
-  // 2. Алгоритм разметки связных областей (Connected Component Labeling - CCL) через итеративный BFS
+  // 2. Алгоритм разметки связных областей (Connected Component Labeling - CCL) через BFS
   const visited = Array(height).fill(null).map(() => Array(width).fill(false));
+  const ccLabels: number[][] = Array(height).fill(null).map(() => Array(width).fill(0));
   const components: {
     minX: number;
     maxX: number;
@@ -138,7 +188,7 @@ export function getBinaryGrid(
     pixels: { x: number; y: number }[];
   }[] = [];
 
-  // 8-связное перемещение (Moore neighborhood offsets)
+  // 8-connected offsets
   const dx = [0, 1, 1, 1, 0, -1, -1, -1];
   const dy = [-1, -1, 0, 1, 1, 1, 0, -1];
 
@@ -146,18 +196,21 @@ export function getBinaryGrid(
     for (let x = 0; x < width; x++) {
       if (grid[y][x] && !visited[y][x]) {
         // Найдена новая компонента
+        const compId = components.length + 1;
         const compPixels: { x: number; y: number }[] = [];
         let compMinX = x, compMaxX = x;
         let compMinY = y, compMaxY = y;
 
         const queue: number[] = [x, y];
         visited[y][x] = true;
+        ccLabels[y][x] = compId;
         let head = 0;
 
         while (head < queue.length) {
           const qx = queue[head++];
           const qy = queue[head++];
           compPixels.push({ x: qx, y: qy });
+          ccLabels[qy][qx] = compId;
 
           if (qx < compMinX) compMinX = qx;
           if (qx > compMaxX) compMaxX = qx;
@@ -171,6 +224,7 @@ export function getBinaryGrid(
             if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
               if (grid[ny][nx] && !visited[ny][nx]) {
                 visited[ny][nx] = true;
+                ccLabels[ny][nx] = compId;
                 queue.push(nx, ny);
               }
             }
@@ -188,8 +242,43 @@ export function getBinaryGrid(
     }
   }
 
+  if (typeof window !== 'undefined' && (window as any).__forensic_trace) {
+    (window as any).__forensic_trace.lastCcLabels = ccLabels;
+  }
+
+  // Update global trace metrics
+  if (typeof window !== 'undefined' && (window as any).__forensic_trace) {
+    (window as any).__forensic_trace.totalComponents += components.length;
+  }
+
+  console.log(`Connected components labeling found: ${components.length} islands`);
+
+  // Find maximum component size to filter noise intelligently
+  let maxCompArea = 0;
+  for (const comp of components) {
+    if (comp.pixels.length > maxCompArea) {
+      maxCompArea = comp.pixels.length;
+    }
+  }
+
+  components.forEach((comp, idx) => {
+    const compW = comp.maxX - comp.minX;
+    const compH = comp.maxY - comp.minY;
+    const area = comp.pixels.length;
+    console.log(`  Connected Component Label #${idx} | Area: ${area} pixels | Bounds: x:[${comp.minX}, ${comp.maxX}], y:[${comp.minY}, ${comp.maxY}] (w: ${compW}, h: ${compH})`);
+    
+    // Warn if a small component is detected which might be noise
+    if (area < 25) {
+      console.warn(`    %c[FORENSIC WARNING] POSSIBLE NOISE COMPONENT: Component #${idx} (Area: ${area} pixels is smaller than absolute 25px noise thresh)`, "color: #b45309;");
+    } else if (maxCompArea > 0 && area < maxCompArea * 0.08) {
+      console.warn(`    %c[FORENSIC WARNING] POSSIBLE NOISE COMPONENT: Component #${idx} (Area: ${area} pixels is < 8% of dominant component size ${maxCompArea}px)`, "color: #b45309;");
+    }
+  });
+
   // 3. Классификация компонент и умная чистка (Умный Padding + Защита от обрезания хвостиков)
   const finalGrid = Array(height).fill(null).map(() => Array(width).fill(false));
+  let removedComponents = 0;
+  let remainingComponents = 0;
 
   for (const comp of components) {
     const compW = comp.maxX - comp.minX;
@@ -213,16 +302,26 @@ export function getBinaryGrid(
     const isPrintedHint = comp.maxY < cellH * 0.35 && comp.maxX < cellW * 0.40 && compW < cellW * 0.20 && compH < cellH * 0.20;
 
     // Отсечение одиночного фонового шума
-    const isNoise = compSize < 4;
+    const isNoise = compSize < 25;
 
     // Символ сохраняется целиком, если хотя бы частично пересекает безопасную зону
     // Это автоматически сохраняет длинные штрихи ("хвостики") букв вне безопасной зоны!
     const shouldKeep = overlapsSafeZone && !isBorderLine && !isTooBig && !isNoise && !isPrintedHint;
 
     if (shouldKeep) {
+      remainingComponents++;
       for (const p of comp.pixels) {
         finalGrid[p.y][p.x] = true;
       }
+    } else {
+      removedComponents++;
+      const reasons: string[] = [];
+      if (!overlapsSafeZone) reasons.push("No safe zone intersection");
+      if (isBorderLine) reasons.push("Grid line/Border geometry matched");
+      if (isTooBig) reasons.push("Gigantic frame overlap");
+      if (isNoise) reasons.push("Extreme noise speckle");
+      if (isPrintedHint) reasons.push("Top-left template hint text match");
+      console.log(`  Rejected component: Area: ${compSize}px | Reasons: ${reasons.join(", ")}`);
     }
   }
 
@@ -265,6 +364,12 @@ export function getBinaryGrid(
     }
   }
 
+  const endTime = performance.now();
+  console.log(`%c[FORENSIC EXIT] getBinaryGrid`, "color: #7c3aed; font-weight: bold;");
+  console.log(`Components kept: ${remainingComponents}, Components rejected: ${removedComponents}`);
+  console.log(`Delineated ink bbox limits: X: [${minX}, ${maxX}] | Y: [${minY}, ${maxY}] (w: ${maxX - minX}, h: ${maxY - minY})`);
+  console.log(`Binarize run-time: ${(endTime - startTime).toFixed(2)}ms`);
+
   return { data: resultGrid, width, height };
 }
 
@@ -306,8 +411,91 @@ function perpendicularDistance(p: Point, lineStart: Point, lineEnd: Point): numb
   return num / den;
 }
 
+// Trace a single contour from matching edge segments
+export function traceSingleContour(
+  startPt: Point,
+  firstKey: string,
+  adj: Map<string, Point[]>
+): Point[] {
+  console.log(`%c[FORENSIC ENTER] traceSingleContour`, "color: #0369a1");
+  console.log(`Starting point: (${startPt.x}, ${startPt.y})`);
+  
+  const currentContour: Point[] = [startPt];
+  let currKey = firstKey;
+  let steps = 0;
+  let visitedPixelsCount = 0;
+  let terminationReason = "unknown";
+  
+  while (true) {
+    const list = adj.get(currKey);
+    if (!list || list.length === 0) {
+      adj.delete(currKey);
+      terminationReason = "dead end (no adjacent segments)";
+      break;
+    }
+    
+    const nextPt = list.pop()!;
+    if (list.length === 0) {
+      adj.delete(currKey);
+    }
+    
+    currentContour.push(nextPt);
+    currKey = `${nextPt.x},${nextPt.y}`;
+    steps++;
+    visitedPixelsCount++;
+    
+    if (nextPt.x === startPt.x && nextPt.y === startPt.y) {
+      terminationReason = "loop closed back to starting point";
+      break;
+    }
+    
+    if (steps > 50000) {
+      terminationReason = "excessive steps safety break (possible infinite loop)";
+      break;
+    }
+  }
+
+  const id = getNextContourId();
+  const c = currentContour as any;
+  c.id = id;
+  c.globalId = `Contour #${id}`;
+  c.origin = "traceContours()";
+  c.steps = steps;
+  c.visited = visitedPixelsCount;
+  c.terminationReason = terminationReason;
+
+  // Bounding box calculation for warning checks
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of currentContour) {
+    if (p.x < minX) minX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y > maxY) maxY = p.y;
+  }
+  const w = maxX - minX;
+  const h = maxY - minY;
+
+  console.log(`Contour ID: ${c.globalId}`);
+  console.log(`Steps: ${steps}, Visited points: ${visitedPixelsCount}`);
+  console.log(`Bounding Box: {x: ${minX}, y: ${minY}, w: ${w}, h: ${h}}`);
+  console.log(`Termination reason: ${terminationReason}`);
+
+  if (w < 5 || h < 5) {
+    console.warn(`%cWARNING: SMALL CONTOUR (w: ${w}, h: ${h})`, "color: #b45309");
+  } else if (w > 1638 || h > 1638) {
+    console.warn(`%cWARNING: OVERSIZED CONTOUR (w: ${w}, h: ${h})`, "color: #b45309");
+  }
+
+  console.log(`%c[FORENSIC EXIT] traceSingleContour: returned ${currentContour.length} points`, "color: #0369a1");
+  return currentContour;
+}
+
 // Marching Squares Contour Tracing algorithm
 export function traceContours(grid: boolean[][], width: number, height: number): Point[][] {
+  console.log(`%c[FORENSIC ENTER] traceContours`, "color: #0284c7; font-weight: bold;");
+  console.log(`Input grid dimensions: ${width}x${height}`);
+  const startTime = performance.now();
+
   const segments: { p1: Point; p2: Point }[] = [];
 
   // Iterate over all 2x2 blocks (corners)
@@ -362,33 +550,22 @@ export function traceContours(grid: boolean[][], width: number, height: number):
     const parts = firstKey.split(',');
     const startPt = { x: parseFloat(parts[0]), y: parseFloat(parts[1]) };
     
-    const currentContour: Point[] = [startPt];
-    let currKey = firstKey;
-    
-    while (true) {
-      const list = adj.get(currKey);
-      if (!list || list.length === 0) {
-        adj.delete(currKey);
-        break;
-      }
-      
-      const nextPt = list.pop()!;
-      if (list.length === 0) {
-        adj.delete(currKey);
-      }
-      
-      currentContour.push(nextPt);
-      currKey = `${nextPt.x},${nextPt.y}`;
-      
-      if (nextPt.x === startPt.x && nextPt.y === startPt.y) {
-        break;
-      }
-    }
+    const currentContour = traceSingleContour(startPt, firstKey, adj);
     
     if (currentContour.length > 4) {
       contours.push(currentContour);
     }
   }
+
+  // Update global trace metrics
+  if (typeof window !== 'undefined' && (window as any).__forensic_trace) {
+    (window as any).__forensic_trace.totalContours += contours.length;
+  }
+
+  const endTime = performance.now();
+  console.log(`%c[FORENSIC EXIT] traceContours`, "color: #0284c7; font-weight: bold;");
+  console.log(`Total contours found & stored: ${contours.length}`);
+  console.log(`Time elapsed: ${(endTime - startTime).toFixed(2)}ms`);
 
   return contours;
 }
@@ -569,7 +746,27 @@ export function isLikelyTableLineOrBoxSymbol(
   destW?: number,
   destH?: number
 ): boolean {
-  if (contour.length < 5) return true; // Too few points to represent a legitimate character shape
+  const globalId = (contour as any).globalId || "Contour #Unassigned";
+  console.log(`%c[FORENSIC ENTER] isLikelyTableLineOrBoxSymbol: checking ${globalId} for glyph '${char}'`, "color: #0d9488");
+  console.log(`Contour point count: ${contour.length}, canvas dimensions: ${imgWidth}x${imgHeight}`);
+
+  const finishLogAndReturn = (isTableLine: boolean, reason: string) => {
+    console.log(`Result for ${globalId}: ${isTableLine ? "REJECTED (TableLine/Box)" : "APPROVED (Handwriting)"}`);
+    console.log(`Reason: ${reason}`);
+    console.log(`%c[FORENSIC EXIT] isLikelyTableLineOrBoxSymbol: finished checking ${globalId}`, "color: #0d9488");
+    if (isTableLine) {
+      (contour as any).filterReason = reason;
+      (contour as any).isFiltered = true;
+      if (typeof window !== 'undefined' && (window as any).__forensic_trace) {
+        (window as any).__forensic_trace.totalRejectedContours++;
+      }
+    }
+    return isTableLine;
+  };
+
+  if (contour.length < 5) {
+    return finishLogAndReturn(true, "point count < 5 (Too short to be a valid brushstroke)");
+  }
 
   let cMinX = Infinity, cMinY = Infinity;
   let cMaxX = -Infinity, cMaxY = -Infinity;
@@ -582,57 +779,77 @@ export function isLikelyTableLineOrBoxSymbol(
 
   const w = cMaxX - cMinX;
   const h = cMaxY - cMinY;
+  console.log(`Contour bounds: x: [${cMinX}, ${cMaxX}] | y: [${cMinY}, ${cMaxY}] (w: ${w}, h: ${h})`);
 
   // 1. Extreme Speckles / Dust / Noise filter
-  if (w <= imgWidth * 0.015 && h <= imgHeight * 0.015) return true;
+  const speckleLimitW = imgWidth * 0.015;
+  const speckleLimitH = imgHeight * 0.015;
+  if (w <= speckleLimitW && h <= speckleLimitH) {
+    return finishLogAndReturn(true, `Extreme speckle/noise (w: ${w} <= ${speckleLimitW.toFixed(1)}, h: ${h} <= ${speckleLimitH.toFixed(1)})`);
+  }
 
   // 2. Outermost boundary frames (entire grid cell layout frame leaks)
-  if (w > imgWidth * 0.88 || h > imgHeight * 0.88) return true;
+  const cellLimitW = imgWidth * 0.88;
+  const cellLimitH = imgHeight * 0.88;
+  if (w > cellLimitW || h > cellLimitH) {
+    return finishLogAndReturn(true, `Outermost cell border leak (w: ${w} > ${cellLimitW.toFixed(1)} or h: ${h} > ${cellLimitH.toFixed(1)})`);
+  }
 
   const cellBoxW = destW !== undefined ? destW : imgWidth;
   const cellBoxH = destH !== undefined ? destH : imgHeight;
 
-  if (w > cellBoxW * 0.88 || h > cellBoxH * 0.88) return true;
+  if (w > cellBoxW * 0.88 || h > cellBoxH * 0.88) {
+    return finishLogAndReturn(true, `Outermost sub-cell border leak (w: ${w} > ${(cellBoxW * 0.88).toFixed(1)} or h: ${h} > ${(cellBoxH * 0.88).toFixed(1)})`);
+  }
 
   const activeLeft = destX !== undefined ? destX : Math.round(imgWidth * 0.095);
   const activeTop = destY !== undefined ? destY : Math.round(imgHeight * 0.095);
   const activeRight = (destX !== undefined && destW !== undefined) ? (destX + destW) : (imgWidth - Math.round(imgWidth * 0.095));
   const activeBottom = (destY !== undefined && destH !== undefined) ? (destY + destH) : (imgHeight - Math.round(imgHeight * 0.095));
 
-  // 3. Margin Rejections: Discard standalone contours lying completely within extreme outer margin edges (aligned with 1% border clearance)
-  // Left border margin leak
-  if (cMaxX < activeLeft + cellBoxW * 0.01) return true;
-  // Right border margin leak
-  if (cMinX > activeRight - cellBoxW * 0.01) return true;
-  // Bottom border margin leak
-  if (cMinY > activeBottom - cellBoxH * 0.01) return true;
-  // Top border margin leak
+  // 3. Margin Rejections: Discard standalone contours lying completely within extreme outer margin edges
+  if (cMaxX < activeLeft + cellBoxW * 0.01) {
+    return finishLogAndReturn(true, `Left margin boundary leak (cMaxX: ${cMaxX} < ${activeLeft + cellBoxW * 0.01})`);
+  }
+  if (cMinX > activeRight - cellBoxW * 0.01) {
+    return finishLogAndReturn(true, `Right margin boundary leak (cMinX: ${cMinX} > ${activeRight - cellBoxW * 0.01})`);
+  }
+  if (cMinY > activeBottom - cellBoxH * 0.01) {
+    return finishLogAndReturn(true, `Bottom margin boundary leak (cMinY: ${cMinY} > ${activeBottom - cellBoxH * 0.01})`);
+  }
   if (cMaxY < activeTop + cellBoxH * 0.01) {
     const isCloseToLeft = cMinX < activeLeft + cellBoxW * 0.01;
     const isCloseToRight = cMaxX > activeRight - cellBoxW * 0.01;
     const isVeryWideAndThin = w > cellBoxW * 0.01 && h < cellBoxH * 0.01;
     if (isCloseToLeft || isCloseToRight || isVeryWideAndThin) {
-      return true;
+      return finishLogAndReturn(true, `Top margin boundary leak combo (isCloseToLeft: ${isCloseToLeft}, isCloseToRight: ${isCloseToRight}, isVeryWideAndThin: ${isVeryWideAndThin})`);
     }
   }
 
   // 4. Printed label characters in the top-left cell corner (e.g., "А", "Б" printed hints)
-  const isTopLeftLabel = cMaxX < activeLeft + cellBoxW * 0.26 && 
-                         cMaxY < activeTop + cellBoxH * 0.24 && 
-                         w < cellBoxW * 0.14 && 
-                         h < cellBoxH * 0.14;
-  if (isTopLeftLabel) return true;
+  const isTopLeftLabel = cMaxX < activeLeft + cellBoxW * 0.29 && 
+                         cMaxY < activeTop + cellBoxH * 0.27 && 
+                         w < cellBoxW * 0.16 && 
+                         h < cellBoxH * 0.16;
+  if (isTopLeftLabel) {
+    return finishLogAndReturn(true, `isTopLeftLabel: hits top-left reference digit/hint zone`);
+  }
 
-  // 5. Extreme Aspect Ratio Check (typical for long horizontal/vertical line leaks)
+  // 5. Extreme Aspect Ratio Check
   const aspectH = w / (h || 1);
   const aspectV = h / (w || 1);
-  if (aspectH > 14.0 && w > cellBoxW * 0.25) return true; // Too flat line
-  if (aspectV > 14.0 && h > cellBoxH * 0.25) return true; // Too vertical line
+  if (aspectH > 14.0 && w > cellBoxW * 0.25) {
+    return finishLogAndReturn(true, `Extreme horizontal aspect ratio (aspectH: ${aspectH.toFixed(2)} > 14.0)`);
+  }
+  if (aspectV > 14.0 && h > cellBoxH * 0.25) {
+    return finishLogAndReturn(true, `Extreme vertical aspect ratio (aspectV: ${aspectV.toFixed(2)} > 14.0)`);
+  }
 
   // 6. Mechanical Line / Axis-Aligned Grid analysis
-  // Check if segments are almost perfectly horizontal or vertical (which represents table grids, boxes, or lines)
   const simplified = simplifyContour(contour, 1.5);
-  if (simplified.length < 3) return true; // Discard straight single-line contours with zero area
+  if (simplified.length < 3) {
+    return finishLogAndReturn(true, `Straight line contour with zero area (simplified length: ${simplified.length} < 3)`);
+  }
 
   let totalLength = 0;
   let axisAlignedLength = 0;
@@ -651,7 +868,6 @@ export function isLikelyTableLineOrBoxSymbol(
     const angleRad = Math.abs(Math.atan2(dy, dx));
     const angleDeg = (angleRad * 180) / Math.PI;
 
-    // Perfectly horizontal (close to 0 or 180) or perfectly vertical (close to 90)
     const isHorizontal = angleDeg < 6 || Math.abs(angleDeg - 180) < 6;
     const isVertical = Math.abs(angleDeg - 90) < 6;
 
@@ -662,23 +878,24 @@ export function isLikelyTableLineOrBoxSymbol(
 
   if (totalLength > 0) {
     const axisRatio = axisAlignedLength / totalLength;
-    
-    // If segments are highly axis-aligned and a flat or corner-like shape:
-    // Exclude if it has > 85% mechanical segments paired with rectilinear geometry
+    console.log(`Axis aligned mechanical segments ratio for ${globalId}: ${axisRatio.toFixed(2)} (totalLen: ${totalLength.toFixed(1)}px, axisLen: ${axisAlignedLength.toFixed(1)}px)`);
     const looksLikeGridOrCorner = (axisRatio >= 0.85);
+    
     if (looksLikeGridOrCorner && totalLength > 100) {
       const nearBorderX = cMinX < activeLeft + cellBoxW * 0.26 || cMaxX > activeRight - cellBoxW * 0.26;
       const nearBorderY = cMinY < activeTop + cellBoxH * 0.26 || cMaxY > activeBottom - cellBoxH * 0.26;
       if (nearBorderX || nearBorderY) {
-        return true; // Strongly indicates a leaked grid-line boundary or corner!
+        return finishLogAndReturn(true, `Highly axis-aligned near boundary, looks like grid corner/rule (axis-aligned ratio: ${axisRatio.toFixed(2)})`);
       }
     }
   }
 
-  // 7. Hard-coded segment length constraints (long uninterrupted straight borders)
+  // 7. Hard-coded segment length constraints
   const isTooLongAndStraight = (w > cellBoxW * 0.40 && h < cellBoxH * 0.08) ||
                                (h > cellBoxH * 0.40 && w < cellBoxW * 0.08);
-  if (isTooLongAndStraight) return true;
+  if (isTooLongAndStraight) {
+    return finishLogAndReturn(true, `Long straight border-like shape (isTooLongAndStraight check matched)`);
+  }
 
   // 8. Specialized margin line filter checks
   const isThinVertical = w <= cellBoxW * 0.085 && h >= cellBoxH * 0.10;
@@ -688,7 +905,7 @@ export function isLikelyTableLineOrBoxSymbol(
     const rightBoundary = activeRight - cellBoxW * (isYCase ? 0.14 : 0.28);
     const cX = (cMinX + cMaxX) / 2;
     if (cX < leftBoundary || cX > rightBoundary) {
-      return true;
+      return finishLogAndReturn(true, `Thin vertical margin line leak (cX: ${cX.toFixed(1)} lies outside of safe boundaries)`);
     }
   }
 
@@ -699,7 +916,7 @@ export function isLikelyTableLineOrBoxSymbol(
     const bottomBoundary = activeBottom - cellBoxH * 0.28;
     const cY = (cMinY + cMaxY) / 2;
     if (cY < topBoundary || cY > bottomBoundary) {
-      return true;
+      return finishLogAndReturn(true, `Thin horizontal margin line leak (cY: ${cY.toFixed(1)} lies outside of safe boundaries)`);
     }
   }
 
@@ -710,11 +927,11 @@ export function isLikelyTableLineOrBoxSymbol(
     const fillRatio = area / (bboxArea || 1);
     
     if (fillRatio > 0.95 && totalLength > 120) {
-      return true; 
+      return finishLogAndReturn(true, `Perfect rectangle box drawing leak (fillRatio: ${fillRatio.toFixed(2)} > 0.95)`);
     }
   }
 
-  // 10. Center stencil character hint leak check (e.g. printed "А", "б" backdrop in the center)
+  // 10. Center stencil character hint leak check
   const cCenterX = (cMinX + cMaxX) / 2;
   const cCenterY = (cMinY + cMaxY) / 2;
   const cellCenterX = activeLeft + cellBoxW / 2;
@@ -731,14 +948,80 @@ export function isLikelyTableLineOrBoxSymbol(
     const bboxArea = w * h;
     const polygonRatio = area / (bboxArea || 1);
     
-    // Stencils are thin-outline figures printed on paper. Their bounding box fill ratio is tiny,
-    // or they represent thin shapes with very low ink density.
     if (polygonRatio < 0.25 || area < 400) {
-      return true;
+      return finishLogAndReturn(true, `Center stencil backdrop text hint leak (centered, stencil-sized and low density ratio: ${polygonRatio.toFixed(2)})`);
     }
   }
 
-  return false; // Safely validated as genuine handwriting!
+  return finishLogAndReturn(false, "Validated as genuine handwriting brushstroke!");
+}
+
+export function buildGlyphContours(
+  contours: Point[][],
+  imgWidth: number,
+  imgHeight: number,
+  char: string,
+  destX?: number,
+  destY?: number,
+  destW?: number,
+  destH?: number
+): Point[][] {
+  console.log(`%c[FORENSIC ENTER] buildGlyphContours for character '${char}'`, "color: #4f46e5; font-weight: bold;");
+  const unicodeVal = char.codePointAt(0);
+  console.log(`Unicode: ${unicodeVal} (0x${unicodeVal?.toString(16)})`);
+
+  // Log all contour IDs that we are processing in this glyph
+  const contourIds = contours.map(c => (c as any).globalId || "Unassigned");
+  console.log(`Source contour IDs inside cell: ${JSON.stringify(contourIds)}`);
+
+  // Pre-calculate filter results for each contour
+  const isLikelyBox = contours.map(contour => isLikelyTableLineOrBoxSymbol(
+    contour,
+    imgWidth,
+    imgHeight,
+    char,
+    destX,
+    destY,
+    destW,
+    destH
+  ));
+
+  // STRICT LAYER SEPARATION: Isolate handwriting contours only (Layer 3)
+  const filteredContours = contours.filter((contour, i) => {
+    const cid = (contour as any).globalId || `Contour #${i}`;
+    let keepResult = false;
+    let keepReason = "";
+
+    if (!isLikelyBox[i]) {
+      keepResult = true;
+      keepReason = "Not classified as table/border line or noise";
+    } else {
+      // If it WAS detected as a box/line, but it's an inner hole of a VALID contour, we keep it!
+      for (let j = 0; j < contours.length; j++) {
+        if (i !== j && !isLikelyBox[j]) {
+          if (isPointInPolygon(contour[0], contours[j])) {
+            keepResult = true;
+            keepReason = `Classified as box/line but saved because it represents an inner hole within valid contour ${(contours[j] as any).globalId}`;
+            break;
+          }
+        }
+      }
+    }
+
+    if (keepResult) {
+      console.log(`  Keeping contour ${cid}: ${keepReason}`);
+      (contour as any).assignedGlyph = char;
+      (contour as any).unicodeCode = unicodeVal;
+    } else {
+      console.log(`  Filtering out contour ${cid}: Classified as trash/leak`);
+      (contour as any).isFiltered = true;
+    }
+    return keepResult;
+  });
+
+  console.log(`Survived contours count: ${filteredContours.length} of ${contours.length}`);
+  console.log(`%c[FORENSIC EXIT] buildGlyphContours for character '${char}'`, "color: #4f46e5; font-weight: bold;");
+  return filteredContours;
 }
 
 // Bezier-aware bounding box calculations for exact path extreme limits
@@ -828,14 +1111,18 @@ export function createFontPaths(
   destW?: number,
   destH?: number
 ): { paths: PathCommand[][]; advanceWidth: number } {
+  console.log(`%c[FORENSIC ENTER] createFontPaths for character '${char}'`, "color: #4f46e5; font-weight: bold;");
+  console.log(`Input contour count: ${contours.length}`);
+
   // Prevent extraction of banned/unicode characters
   if (!isValidCharacterUnicode(char)) {
+    console.warn(`%c[FORENSIC EXIT] createFontPaths: character '${char}' is outside of valid/allowed unicode ranges`, "color: #b45309;");
     return { paths: [], advanceWidth: 5734 };
   }
 
-  // Pre-calculate filter results for each contour
-  const isLikelyBox = contours.map(contour => isLikelyTableLineOrBoxSymbol(
-    contour,
+  // STRICT LAYER SEPARATION: Isolate handwriting contours only (Layer 3)
+  const filteredContours = buildGlyphContours(
+    contours,
     imgWidth,
     imgHeight,
     char,
@@ -843,26 +1130,11 @@ export function createFontPaths(
     destY,
     destW,
     destH
-  ));
-
-  // STRICT LAYER SEPARATION: Isolate handwriting contours only (Layer 3)
-  // We keep a contour if it is NOT a box symbol, OR if it is completely inside a contour that is kept.
-  const filteredContours = contours.filter((contour, i) => {
-    if (!isLikelyBox[i]) return true;
-
-    // Wait, if it WAS detected as a box/line, but it's an inner hole of a VALID contour, we keep it!
-    for (let j = 0; j < contours.length; j++) {
-      if (i !== j && !isLikelyBox[j]) {
-        if (isPointInPolygon(contour[0], contours[j])) {
-          return true; // Keep inner holes
-        }
-      }
-    }
-    return false;
-  });
+  );
 
   if (filteredContours.length === 0) {
     // Return empty space with default width
+    console.log(`%c[FORENSIC EXIT] createFontPaths: zero filtered contours survive for '${char}'. Space glyph produced.`, "color: #4f46e5;");
     return { paths: [], advanceWidth: 5734 };
   }
 
@@ -1067,10 +1339,11 @@ export function createFontPaths(
   const outOfTop = bezierBounds.yMax > align.yMax;
   const outOfBottom = bezierBounds.yMin < align.yMin;
 
+  let finalPathsToReturn = resultPaths;
   if (outOfTop || outOfBottom) {
     // If curves overshot slightly, scale down one final time and re-project
     const shrinkFactor = 0.92;
-    const finalPaths = resultPaths.map(subpath => subpath.map(cmd => {
+    finalPathsToReturn = resultPaths.map(subpath => subpath.map(cmd => {
       const copy = { ...cmd };
       if (copy.x !== undefined) copy.x = Number((half(advanceWidth) + (copy.x - half(advanceWidth)) * shrinkFactor).toFixed(3));
       if (copy.y !== undefined) copy.y = Number((targetCenterY + (copy.y - targetCenterY) * shrinkFactor).toFixed(3));
@@ -1078,10 +1351,22 @@ export function createFontPaths(
       if (copy.y1 !== undefined) copy.y1 = Number((targetCenterY + (copy.y1 - targetCenterY) * shrinkFactor).toFixed(3));
       return copy;
     }));
-    return { paths: finalPaths, advanceWidth };
   }
 
-  return { paths: resultPaths, advanceWidth };
+  const finalBbox = computeBezierAwareBounds(finalPathsToReturn, 0);
+  console.log(`%c[FORENSIC EXIT] createFontPaths for character '${char}'`, "color: #4f46e5; font-weight: bold;");
+  console.log(`  Glyph Character: '${char}'`);
+  console.log(`  Unicode: ${char.codePointAt(0)} (0x${char.codePointAt(0)?.toString(16)})`);
+  console.log(`  Traced contour IDs: ${JSON.stringify(contours.map(c => (c as any).globalId || "Unassigned"))}`);
+  console.log(`  Filtered (surviving) contour IDs: ${JSON.stringify(filteredContours.map(c => (c as any).globalId))}`);
+  console.log(`  Advance Width: ${advanceWidth}`);
+  console.log(`  Final font coords bounding box:`, JSON.stringify(finalBbox));
+
+  if (typeof window !== 'undefined' && (window as any).__forensic_trace) {
+    (window as any).__forensic_trace.totalGlyphs++;
+  }
+
+  return { paths: finalPathsToReturn, advanceWidth };
 }
 
 function half(val: number) {

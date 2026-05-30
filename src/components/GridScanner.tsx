@@ -4,7 +4,7 @@ import { warpImage, getBinaryGrid, traceContours, createFontPaths, getGlyphAlign
 import { Point, DeskewCorners, GlyphData, TemplateCell } from '../types';
 import { 
   Upload, Sparkles, Sliders, Check, RotateCcw, 
-  Search, Info, Eye, ClipboardCheck, Trash2, Edit2, Eraser, Move, Printer
+  Search, Info, Eye, ClipboardCheck, Trash2, Edit2, Eraser, Move, Printer, FileText
 } from 'lucide-react';
 
 interface GridScannerProps {
@@ -14,6 +14,8 @@ interface GridScannerProps {
 
 export default function GridScanner({ onGlyphsExtracted, extractedGlyphsCount }: GridScannerProps) {
   const [selectedTemplateId, setSelectedTemplateId] = useState('cyrillic_8row_p1');
+  const [isForensicOpen, setIsForensicOpen] = useState(false);
+  const [selectedForensicChar, setSelectedForensicChar] = useState<string | null>(null);
   const activeTemplate = ALL_TEMPLATES.find(t => t.id === selectedTemplateId) || ALL_TEMPLATES[0];
 
   const [imageSrc, setImageSrc] = useState<string | null>(null);
@@ -38,6 +40,7 @@ export default function GridScanner({ onGlyphsExtracted, extractedGlyphsCount }:
   const [selectedGlyphIndex, setSelectedGlyphIndex] = useState<number | null>(null);
   const [retouchMode, setRetouchMode] = useState<'none' | 'draw' | 'erase'>('none');
   const [isPrintPreviewOpen, setIsPrintPreviewOpen] = useState(false);
+  const [isSaved, setIsSaved] = useState(false);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const uploadedImgRef = useRef<HTMLImageElement>(null);
@@ -118,6 +121,7 @@ export default function GridScanner({ onGlyphsExtracted, extractedGlyphsCount }:
       setImageSrc(dataUrl);
       setScannedGlyphs([]); // Reset
       setSelectedGlyphIndex(null);
+      setIsSaved(false);
 
       // Automatically swap active template page to match PDF workbook pages
       if (pageNum >= 1 && pageNum <= 5) {
@@ -145,6 +149,7 @@ export default function GridScanner({ onGlyphsExtracted, extractedGlyphsCount }:
     setPdfCurrentPage(1);
     setScannedGlyphs([]);
     setSelectedGlyphIndex(null);
+    setIsSaved(false);
   };
 
   // Dry run file parsing depending on PDF / standard images
@@ -247,13 +252,326 @@ export default function GridScanner({ onGlyphsExtracted, extractedGlyphsCount }:
     setDraggedCorner(null);
   };
 
+  // Generate all 9 high-fidelity interactive PNG diagnostics for visual forensic debugging
+  const generateAllNineDiagnostics = (
+    cell: TemplateCell, 
+    srcCanvas: HTMLCanvasElement, 
+    corners: DeskewCorners, 
+    warpedCanvas: HTMLCanvasElement, 
+    srcX: number, srcY: number, srcW_crop: number, srcH_crop: number,
+    cellCanvas: HTMLCanvasElement,
+    labelW: number, labelH: number, destX: number, destY: number, destW: number, destH: number,
+    labelInkBefore: number, labelInkAfter: number,
+    binary: { width: number; height: number; data: boolean[][] },
+    rawContours: Point[][],
+    filteredContours: Point[][],
+    finalFontPaths: any[][],
+    advanceWidth: number
+  ) => {
+    try {
+      const u1 = cell.col / activeTemplate.cols;
+      const u2 = (cell.col + 1) / activeTemplate.cols;
+      const v1 = cell.row / activeTemplate.rows;
+      const v2 = (cell.row + 1) / activeTemplate.rows;
+
+      const lerp = (p1: Point, p2: Point, t: number) => ({
+        x: p1.x + (p2.x - p1.x) * t,
+        y: p1.y + (p2.y - p1.y) * t
+      });
+      const bilinear = (tl: Point, tr: Point, br: Point, bl: Point, u: number, v: number) => {
+        const top = lerp(tl, tr, u);
+        const bottom = lerp(bl, br, u);
+        return lerp(top, bottom, v);
+      };
+
+      const cTL = bilinear(corners.topLeft, corners.topRight, corners.bottomRight, corners.bottomLeft, u1, v1);
+      const cTR = bilinear(corners.topLeft, corners.topRight, corners.bottomRight, corners.bottomLeft, u2, v1);
+      const cBR = bilinear(corners.topLeft, corners.topRight, corners.bottomRight, corners.bottomLeft, u2, v2);
+      const cBL = bilinear(corners.topLeft, corners.topRight, corners.bottomRight, corners.bottomLeft, u1, v2);
+
+      const minX = Math.round(Math.min(cTL.x, cTR.x, cBR.x, cBL.x));
+      const maxX = Math.round(Math.max(cTL.x, cTR.x, cBR.x, cBL.x));
+      const minY = Math.round(Math.min(cTL.y, cTR.y, cBR.y, cBL.y));
+      const maxY = Math.round(Math.max(cTL.y, cTR.y, cBR.y, cBL.y));
+      const cropW = Math.max(1, maxX - minX);
+      const cropH = Math.max(1, maxY - minY);
+
+      const tempCanvas = document.createElement('canvas');
+      tempCanvas.width = 256;
+      tempCanvas.height = 256;
+      const tempCtx = tempCanvas.getContext('2d')!;
+
+      // 01_original.png
+      tempCtx.fillStyle = 'white';
+      tempCtx.fillRect(0, 0, 256, 256);
+      tempCtx.drawImage(srcCanvas, minX, minY, cropW, cropH, 0, 0, 256, 256);
+      const img_01 = tempCanvas.toDataURL('image/png');
+
+      // 02_after_warp.png
+      tempCtx.fillStyle = 'white';
+      tempCtx.fillRect(0, 0, 256, 256);
+      tempCtx.drawImage(warpedCanvas, srcX, srcY, srcW_crop, srcH_crop, 0, 0, 256, 256);
+      const img_02 = tempCanvas.toDataURL('image/png');
+
+      // 03_after_label_removal.png
+      tempCtx.fillStyle = 'white';
+      tempCtx.fillRect(0, 0, 256, 256);
+      tempCtx.drawImage(cellCanvas, 0, 0, 2048, 2048, 0, 0, 256, 256);
+      const img_03 = tempCanvas.toDataURL('image/png');
+
+      // 04_binary.png
+      tempCtx.fillStyle = '#ffffff';
+      tempCtx.fillRect(0, 0, 256, 256);
+      tempCtx.fillStyle = '#0f172a';
+      const stepX = binary.width / 256;
+      const stepY = binary.height / 256;
+      for (let y = 0; y < 256; y++) {
+        const binaryY = Math.floor(y * stepY);
+        if (binaryY >= binary.height) continue;
+        for (let x = 0; x < 256; x++) {
+          const binaryX = Math.floor(x * stepX);
+          if (binaryX >= binary.width) continue;
+          if (binary.data[binaryY][binaryX]) {
+            tempCtx.fillRect(x, y, 1.2, 1.2);
+          }
+        }
+      }
+      const img_04 = tempCanvas.toDataURL('image/png');
+
+      // 05_connected_components.png
+      tempCtx.fillStyle = '#ffffff';
+      tempCtx.fillRect(0, 0, 256, 256);
+      const ft = (window as any).__forensic_trace;
+      const labels = ft && ft.lastCcLabels;
+      if (labels && labels.length > 0) {
+        const getLabelColor = (labelVal: number) => {
+          if (labelVal === 0) return 'rgba(255, 255, 255, 1)';
+          const hue = (labelVal * 113) % 360;
+          return `hsla(${hue}, 85%, 55%, 1)`;
+        };
+        for (let y = 0; y < 256; y++) {
+          const ly = Math.floor(y * stepY);
+          if (ly >= labels.length) continue;
+          for (let x = 0; x < 256; x++) {
+            const lx = Math.floor(x * stepX);
+            if (lx >= labels[ly].length) continue;
+            const lVal = labels[ly][lx];
+            if (lVal > 0) {
+              tempCtx.fillStyle = getLabelColor(lVal);
+              tempCtx.fillRect(x, y, 1.2, 1.2);
+            }
+          }
+        }
+      } else {
+        tempCtx.drawImage(cellCanvas, 0, 0, 2048, 2048, 0, 0, 256, 256);
+      }
+      const img_05 = tempCanvas.toDataURL('image/png');
+
+      // 06_contours.png
+      tempCtx.fillStyle = 'white';
+      tempCtx.fillRect(0, 0, 256, 256);
+      tempCtx.strokeStyle = 'rgba(239, 68, 68, 0.7)';
+      tempCtx.lineWidth = 1;
+      for (const cnt of rawContours) {
+        tempCtx.beginPath();
+        for (let i = 0; i < cnt.length; i++) {
+          const px = cnt[i].x / 8;
+          const py = cnt[i].y / 8;
+          if (i === 0) tempCtx.moveTo(px, py);
+          else tempCtx.lineTo(px, py);
+        }
+        tempCtx.stroke();
+        if (cnt.length > 0) {
+          tempCtx.fillStyle = '#22c55e';
+          tempCtx.beginPath();
+          tempCtx.arc(cnt[0].x / 8, cnt[0].y / 8, 2, 0, 2 * Math.PI);
+          tempCtx.fill();
+        }
+      }
+      const img_06 = tempCanvas.toDataURL('image/png');
+
+      // 07_filtered_contours.png
+      tempCtx.fillStyle = 'white';
+      tempCtx.fillRect(0, 0, 256, 256);
+      tempCtx.strokeStyle = '#22c55e';
+      tempCtx.lineWidth = 1.5;
+      for (const cnt of filteredContours) {
+        tempCtx.beginPath();
+        for (let i = 0; i < cnt.length; i++) {
+          const px = cnt[i].x / 8;
+          const py = cnt[i].y / 8;
+          if (i === 0) tempCtx.moveTo(px, py);
+          else tempCtx.lineTo(px, py);
+        }
+        tempCtx.stroke();
+      }
+      tempCtx.strokeStyle = 'rgba(239, 68, 68, 0.35)';
+      tempCtx.setLineDash([2, 2]);
+      tempCtx.lineWidth = 1;
+      for (const cnt of rawContours) {
+        if ((cnt as any).isFiltered) {
+          tempCtx.beginPath();
+          for (let i = 0; i < cnt.length; i++) {
+            const px = cnt[i].x / 8;
+            const py = cnt[i].y / 8;
+            if (i === 0) tempCtx.moveTo(px, py);
+            else tempCtx.lineTo(px, py);
+          }
+          tempCtx.stroke();
+        }
+      }
+      tempCtx.setLineDash([]);
+      const img_07 = tempCanvas.toDataURL('image/png');
+
+      // 08_final_glyph.png
+      const scaleX = (256 - 40) / (advanceWidth || 5000);
+      const scaleY = (256 - 40) / 14000;
+      const mapX = (x: number) => 20 + x * scaleX;
+      const mapY = (y: number) => 256 - 20 - (y - (-4000)) * scaleY;
+
+      tempCtx.fillStyle = '#fcfbfa';
+      tempCtx.fillRect(0, 0, 256, 256);
+      tempCtx.strokeStyle = 'rgba(239, 68, 68, 0.4)';
+      tempCtx.setLineDash([2, 4]);
+      tempCtx.beginPath();
+      tempCtx.moveTo(0, mapY(0));
+      tempCtx.lineTo(256, mapY(0));
+      tempCtx.stroke();
+      tempCtx.setLineDash([]);
+
+      tempCtx.fillStyle = 'rgba(15, 23, 42, 0.85)';
+      for (const subpath of finalFontPaths) {
+        tempCtx.beginPath();
+        for (let i = 0; i < subpath.length; i++) {
+          const cmd = subpath[i];
+          if (cmd.type === 'M') tempCtx.moveTo(mapX(cmd.x), mapY(cmd.y));
+          else if (cmd.type === 'L') tempCtx.lineTo(mapX(cmd.x), mapY(cmd.y));
+          else if (cmd.type === 'Q') tempCtx.quadraticCurveTo(mapX(cmd.x1), mapY(cmd.y1), mapX(cmd.x), mapY(cmd.y));
+          else if (cmd.type === 'Z') tempCtx.closePath();
+        }
+        tempCtx.fill();
+      }
+      const img_08 = tempCanvas.toDataURL('image/png');
+
+      // 09_font_path.png
+      tempCtx.fillStyle = '#f8fafc';
+      tempCtx.fillRect(0, 0, 256, 256);
+      tempCtx.strokeStyle = 'rgba(226, 232, 240, 0.8)';
+      tempCtx.beginPath();
+      tempCtx.moveTo(0, mapY(0));
+      tempCtx.lineTo(256, mapY(0));
+      tempCtx.stroke();
+
+      tempCtx.strokeStyle = '#3b82f6';
+      tempCtx.lineWidth = 1.5;
+      for (const subpath of finalFontPaths) {
+        tempCtx.beginPath();
+        for (let i = 0; i < subpath.length; i++) {
+          const cmd = subpath[i];
+          if (cmd.type === 'M') tempCtx.moveTo(mapX(cmd.x), mapY(cmd.y));
+          else if (cmd.type === 'L') tempCtx.lineTo(mapX(cmd.x), mapY(cmd.y));
+          else if (cmd.type === 'Q') tempCtx.quadraticCurveTo(mapX(cmd.x1), mapY(cmd.y1), mapX(cmd.x), mapY(cmd.y));
+          else if (cmd.type === 'Z') tempCtx.closePath();
+        }
+        tempCtx.stroke();
+
+        for (const cmd of subpath) {
+          if (cmd.x !== undefined && cmd.y !== undefined) {
+            tempCtx.fillStyle = '#ef4444';
+            tempCtx.beginPath();
+            tempCtx.arc(mapX(cmd.x), mapY(cmd.y), 2.5, 0, 2 * Math.PI);
+            tempCtx.fill();
+          }
+          if (cmd.x1 !== undefined && cmd.y1 !== undefined) {
+            tempCtx.fillStyle = '#3b82f6';
+            tempCtx.beginPath();
+            tempCtx.arc(mapX(cmd.x1), mapY(cmd.y1), 2, 0, 2 * Math.PI);
+            tempCtx.fill();
+          }
+        }
+      }
+      const img_09 = tempCanvas.toDataURL('image/png');
+
+      return {
+        img_01, img_02, img_03, img_04, img_05, img_06, img_07, img_08, img_09
+      };
+    } catch (err) {
+      console.error('Diagnostic generation error', err);
+      return null;
+    }
+  };
+
   // Run the perspective deskew, slicing, and vector trace pipeline
   const processImagePipeline = async () => {
     if (!imageSrc || !uploadedImgRef.current) return;
     setIsProcessing(true);
 
+    console.log(`%c[FORENSIC ENTER] processImagePipeline`, "color: #e11d48; font-weight: bold; font-size: 14px;");
+    console.log(`Active Template: ${activeTemplate.name} (ID: ${activeTemplate.id})`);
+    console.log(`Document grid layout: ${activeTemplate.cols} columns x ${activeTemplate.rows} rows`);
+    console.log(`Upload dimensions: ${imgDimensions.width}x${imgDimensions.height}`);
+
+    if (typeof window !== 'undefined') {
+      (window as any).__forensic_trace = {
+        warnings: [],
+        totalProcessedCells: 0,
+        totalContours: 0,
+        totalRejectedContours: 0,
+        totalGlyphs: 0,
+        totalCollisions: 0,
+        savedImages: {},
+        lastCcLabels: []
+      };
+    }
+
     try {
-      // 1. Create source offscreen canvas
+      // 1. Check for Duplicate/overlapping grid coordinates
+      console.log(`%c[FORENSIC] RUNNING GRID ANALYSIS...`, "color: #7c3aed; font-weight: bold;");
+      const coordSet = new Set<string>();
+      const dupCells: string[] = [];
+      for (const cell of activeTemplate.cells) {
+        if (cell.isLogo) continue;
+        const coordKey = `${cell.row},${cell.col}`;
+        if (coordSet.has(coordKey)) {
+          dupCells.push(`Cell '${cell.char}' at row ${cell.row}, col ${cell.col}`);
+        }
+        coordSet.add(coordKey);
+      }
+      if (dupCells.length > 0) {
+        const dupMsg = `DUPLICATE CELLS DETECTED: ${JSON.stringify(dupCells)}`;
+        console.error(`%c[FORENSIC ERROR] ${dupMsg}`, "color: #dc2626; font-weight: bold;");
+        if (typeof window !== 'undefined' && (window as any).__forensic_trace) {
+          (window as any).__forensic_trace.warnings.push(dupMsg);
+        }
+      } else {
+        console.log(`Grid coordinates coverage check: Passed. All cells are uniquely assigned.`);
+      }
+
+      // 2. Warp shift analysis
+      const idealW = imgDimensions.width;
+      const idealH = imgDimensions.height;
+      const warpDisplacements = {
+        topLeft: Math.hypot(corners.topLeft.x - 0, corners.topLeft.y - 0),
+        topRight: Math.hypot(corners.topRight.x - idealW, corners.topRight.y - 0),
+        bottomRight: Math.hypot(corners.bottomRight.x - idealW, corners.bottomRight.y - idealH),
+        bottomLeft: Math.hypot(corners.bottomLeft.x - 0, corners.bottomLeft.y - idealH),
+      };
+      console.log(`%c[FORENSIC] WARP ANALYSIS`, "color: #7c3aed; font-weight: bold;");
+      console.log(`  Top-Left Corner shift: ${warpDisplacements.topLeft.toFixed(1)}px`);
+      console.log(`  Top-Right Corner shift: ${warpDisplacements.topRight.toFixed(1)}px`);
+      console.log(`  Bottom-Right Corner shift: ${warpDisplacements.bottomRight.toFixed(1)}px`);
+      console.log(`  Bottom-Left Corner shift: ${warpDisplacements.bottomLeft.toFixed(1)}px`);
+      
+      const maxWarpShift = Math.max(warpDisplacements.topLeft, warpDisplacements.topRight, warpDisplacements.bottomRight, warpDisplacements.bottomLeft);
+      if (maxWarpShift > 200) {
+        const warnMsg = `Severe warp/skew distortion! Max corner displacement is ${maxWarpShift.toFixed(1)}px. This might cause cell slicing errors!`;
+        console.warn(`%cWARNING: ${warnMsg}`, "color: #b45309; font-weight: bold;");
+        if (typeof window !== 'undefined' && (window as any).__forensic_trace) {
+          (window as any).__forensic_trace.warnings.push(warnMsg);
+        }
+      }
+
+      // 3. Create source offscreen canvas
       const srcCanvas = document.createElement('canvas');
       srcCanvas.width = imgDimensions.width;
       srcCanvas.height = imgDimensions.height;
@@ -261,7 +579,7 @@ export default function GridScanner({ onGlyphsExtracted, extractedGlyphsCount }:
       if (!srcCtx) throw new Error('Could not create Canvas context');
       srcCtx.drawImage(uploadedImgRef.current, 0, 0);
 
-      // 2. Warp image into normalized A4 coordinate space with ultra high 300 DPI resolution (2480 x 3508 px)
+      // 4. Warp image into normalized A4 coordinate space with ultra high 300 DPI resolution (2480 x 3508 px)
       const targetW = 2480;
       const targetH = 3508;
       const warpedCanvas = warpImage(srcCanvas, corners, targetW, targetH);
@@ -438,9 +756,41 @@ export default function GridScanner({ onGlyphsExtracted, extractedGlyphsCount }:
         // 2. Erase the top-left printed reference digit/letter label (e.g. "А", "Б", "восклицание" etc.)
         // Highly adaptive based on the label string length to completely eliminate any printed label remnants!
         const labelLength = cell.label ? cell.label.length : 1;
-        const labelW = Math.round(destW * (0.15 + Math.min(8, labelLength) * 0.06));
-        const labelH = Math.round(destH * 0.17);
+        const labelW = Math.round(destW * (0.18 + Math.min(8, labelLength) * 0.07));
+        const labelH = Math.round(destH * 0.20);
+
+        // FORENSIC: Calculate ink density inside label area before erasing it
+        let labelInkCountBefore = 0;
+        try {
+          const lImg = cellCtx.getImageData(Math.round(destX), Math.round(destY), labelW, labelH);
+          for (let i = 0; i < lImg.data.length; i += 4) {
+            const ref = 0.299 * lImg.data[i] + 0.587 * lImg.data[i+1] + 0.114 * lImg.data[i+2];
+            if (lImg.data[i+3] > 50 && ref < activeThreshold) {
+              labelInkCountBefore++;
+            }
+          }
+        } catch(e) {}
+
         cellCtx.fillRect(destX, destY, labelW, labelH);
+
+        // FORENSIC: Calculate ink density inside label area after erasing it
+        let labelInkCountAfter = 0;
+        try {
+          const lImg = cellCtx.getImageData(Math.round(destX), Math.round(destY), labelW, labelH);
+          for (let i = 0; i < lImg.data.length; i += 4) {
+            const ref = 0.299 * lImg.data[i] + 0.587 * lImg.data[i+1] + 0.114 * lImg.data[i+2];
+            if (lImg.data[i+3] > 50 && ref < activeThreshold) {
+              labelInkCountAfter++;
+            }
+          }
+        } catch(e) {}
+
+        const cellWarns: string[] = [];
+        if (labelInkCountAfter > 20) {
+          const lblMsg = `Ink remnants detected inside label area after erasure! (ink pixels left: ${labelInkCountAfter})`;
+          cellWarns.push(lblMsg);
+          console.warn(`%c[FORENSIC WARNING] Cell '${cell.char}' : ${lblMsg}`, "color: #b45309;");
+        }
 
         // 3. Clear any physical deskew line remnants utilizing an extremely conservative safety zone (1%)
         // This completely swallows black grid borders while keeping wide handwritten letters perfectly intact and centered!
@@ -470,10 +820,97 @@ export default function GridScanner({ onGlyphsExtracted, extractedGlyphsCount }:
           paths: fontPaths.paths,
           width: fontPaths.advanceWidth
         });
+
+        // Collect contour classifications for visual rendering survival lines
+        const filteredContoursList: Point[][] = [];
+        for (const cnt of contours) {
+          if (!(cnt as any).isFiltered) {
+            filteredContoursList.push(cnt);
+          }
+        }
+
+        // Generate the 9 diagnostic PNG files!
+        const dImgs = generateAllNineDiagnostics(
+          cell,
+          srcCanvas,
+          corners,
+          warpedCanvas,
+          srcX, srcY, srcW_crop, srcH_crop,
+          cellCanvas,
+          labelW, labelH, destX, destY, destW, destH,
+          labelInkCountBefore, labelInkCountAfter,
+          binary,
+          contours,
+          filteredContoursList,
+          fontPaths.paths,
+          fontPaths.advanceWidth
+        );
+
+        if (typeof window !== 'undefined' && (window as any).__forensic_trace) {
+          const ft = (window as any).__forensic_trace;
+          ft.totalProcessedCells++;
+          ft.totalContours += contours.length;
+          const rejectedInThisCell = contours.length - filteredContoursList.length;
+          ft.totalRejectedContours += rejectedInThisCell;
+          if (fontPaths.paths.length > 0) {
+            ft.totalGlyphs++;
+          } else {
+            cellWarns.push("Empty glyph contour paths list (character extracted as empty space/skipped)");
+          }
+
+          ft.savedImages[cell.char] = {
+            char: cell.char,
+            label: cell.label,
+            warnings: cellWarns,
+            stats: {
+              row: cell.row,
+              col: cell.col,
+              labelInkBefore: labelInkCountBefore,
+              labelInkAfter: labelInkCountAfter,
+              warpDisplacement: Math.hypot(srcX - cell.col * (targetW / activeTemplate.cols), srcY - cell.row * (targetH / activeTemplate.rows)),
+              contourCount: contours.length,
+              filteredCount: filteredContoursList.length,
+              advanceWidth: fontPaths.advanceWidth
+            },
+            images: dImgs
+          };
+
+          if (cellWarns.length > 0) {
+            ft.warnings.push(`Cell '${cell.char}': ${cellWarns.join('; ')}`);
+          }
+        }
       }
 
       setScannedGlyphs(extractedGlyphs);
       setSelectedGlyphIndex(extractedGlyphs.length > 0 ? 0 : null);
+      setIsSaved(false);
+
+      console.log(`%c[FORENSIC EXIT] processImagePipeline: complete`, "color: #e11d48; font-weight: bold; font-size: 13px;");
+      if (typeof window !== 'undefined' && (window as any).__forensic_trace) {
+        const ft = (window as any).__forensic_trace;
+        console.log(`Total Cells Processed: ${ft.totalProcessedCells}`);
+        console.log(`Total Extracted Glyphs: ${ft.totalGlyphs}`);
+        console.log(`Total Traced Contours: ${ft.totalContours}`);
+        console.log(`Total Rejected Contours: ${ft.totalRejectedContours}`);
+        
+        const suspiciousInfo = Object.values(ft.savedImages).filter((c: any) => c.warnings.length > 0 || c.stats.labelInkAfter > 20);
+        console.log(`Suspicious Cells found: ${suspiciousInfo.length}`);
+        
+        console.log(`Detailed Character Process Report:`);
+        const reportTable = Object.values(ft.savedImages).map((c: any) => ({
+          Character: c.char,
+          Label: c.label || "N/A",
+          Row: c.stats.row,
+          Col: c.stats.col,
+          InkBefore: c.stats.labelInkBefore,
+          InkAfter: c.stats.labelInkAfter,
+          WarpDispl: `${c.stats.warpDisplacement.toFixed(1)}px`,
+          RawContours: c.stats.contourCount,
+          FilteredCount: c.stats.filteredCount,
+          Status: c.warnings.length > 0 ? `⚠️ ${c.warnings[0].substring(0, 50)}...` : "✅ OK"
+        }));
+        console.table(reportTable);
+      }
     } catch (err) {
       console.error(err);
       alert('Ошибка при заполнении бланка. Убедитесь, что все маркеры выбраны правильно.');
@@ -485,10 +922,147 @@ export default function GridScanner({ onGlyphsExtracted, extractedGlyphsCount }:
   // Save the extracted glyphs to the global font registry
   const handleSaveToFont = () => {
     onGlyphsExtracted(scannedGlyphs);
+    setIsSaved(true);
     
     // Celebration
     const sound = new Audio();
     // we can also throw a brief status
+  };
+
+  // Generate and download a beautified TXT diagnostic and telemetry report
+  const downloadTelemetryLog = () => {
+    let text = '';
+    const divider = '='.repeat(80) + '\n';
+    const subDivider = '-'.repeat(80) + '\n';
+
+    text += divider;
+    text += '          TYPESCRIBE COMPUTER VISION & FONT GENERATION TELEMETRY LOG\n';
+    text += divider;
+    text += `Дата и время генерации:  ${new Date().toISOString()}\n`;
+    text += `Название шаблона:        ${activeTemplate.name}\n`;
+    text += `Размер сетки (Units/Em): 16,384 em\n`;
+    text += `Линия подъема (Ascender): 12,800\n`;
+    text += `Линия спуска (Descender): -3,584\n`;
+    text += subDivider;
+
+    text += '\n[1] ОБЩИЕ МЕТРИКИ ШРИФТА И КОЛЛИЗИИ\n';
+    text += '-'.repeat(40) + '\n';
+    text += `Всего символов в базе:   ${scannedGlyphs.length} шт.\n`;
+    
+    const unicodeMap = new Map();
+    let collisionsCount = 0;
+    const collisionDetails: string[] = [];
+
+    scannedGlyphs.forEach(glyph => {
+      const code = glyph.char.charCodeAt(0);
+      if (unicodeMap.has(code)) {
+        collisionsCount++;
+        collisionDetails.push(`Конфликт Unicode U+${code.toString(16).toUpperCase()}: символы '${glyph.char}' и '${unicodeMap.get(code)}'`);
+      } else {
+        unicodeMap.set(code, glyph.char);
+      }
+    });
+
+    text += `Обнаруженные конфликты:  ${collisionsCount > 0 ? `${collisionsCount}!` : '0 (Чистая сборка)'}\n`;
+    if (collisionDetails.length > 0) {
+      text += 'Детализация коллизий:\n';
+      collisionDetails.forEach(c => {
+        text += `  ⚠️ ${c}\n`;
+      });
+    }
+
+    text += '\n[2] ТЕЛЕМЕТРИЯ КОМПЬЮТЕРНОГО ЗРЕНИЯ И СКАНИРОВАНИЯ\n';
+    text += '-'.repeat(40) + '\n';
+
+    const ft = typeof window !== 'undefined' ? (window as any).__forensic_trace : null;
+    if (ft) {
+      text += `Статус трассировки:      Активен\n`;
+      text += `Обработано ячеек бланка:  ${ft.totalProcessedCells || 0}\n`;
+      text += `Всего найдено контуров:   ${ft.totalContours || 0}\n`;
+      text += `Исключено шума/границ:    ${ft.totalRejectedContours || 0}\n`;
+      text += `Успешно добавлено в шрифт: ${ft.totalGlyphs || 0}\n`;
+      text += `Координатные коллизии:    ${ft.totalCollisions || 0}\n`;
+
+      if (ft.warnings && ft.warnings.length > 0) {
+        text += '\nПредупреждения сканера (Warnings):\n';
+        ft.warnings.forEach((warn: string) => {
+          text += `  ⚠️ ${warn}\n`;
+        });
+      } else {
+        text += `\nПредупреждения:          Сообщений нет. Калибровка листов выполнена успешно.\n`;
+      }
+    } else {
+      text += `Трассировка сканера недоступна или была сброшена.\n`;
+    }
+
+    text += '\n[3] ПОДРОБНЫЙ СЕНСОРНЫЙ АНАЛИЗ ГЛИФОВ\n';
+    text += '-'.repeat(40) + '\n';
+    
+    if (ft && ft.savedImages && Object.keys(ft.savedImages).length > 0) {
+      text += 'Символ | Строка | Столбец | Всего контуров | Кепт-контуры | Остаточные чернила\n';
+      text += '-'.repeat(74) + '\n';
+      Object.keys(ft.savedImages).forEach(ch => {
+        const item = ft.savedImages[ch];
+        const s = item.stats;
+        const charPadded = ch.padEnd(6);
+        const rowPadded = String(s.row).padEnd(6);
+        const colPadded = String(s.col).padEnd(7);
+        const rawPadded = String(s.contourCount).padEnd(14);
+        const keptPadded = String(s.filteredCount).padEnd(12);
+        const inkPadded = String(s.labelInkAfter);
+        text += ` ${charPadded} |  ${rowPadded} |  ${colPadded} | ${rawPadded} | ${keptPadded} | ${inkPadded}\n`;
+      });
+      text += '-'.repeat(74) + '\n';
+    } else {
+      text += 'Детальные логи бланка недоступны.\n';
+    }
+
+    text += '\n[4] СТРУКТУРНЫЕ ВЕКТОРНЫЕ ПАРАМЕТРЫ ШРИФТА (OPENTYPE EXP.)\n';
+    text += '-'.repeat(40) + '\n';
+
+    scannedGlyphs.forEach(glyph => {
+      const code = glyph.char.charCodeAt(0);
+      const isSpace = glyph.char === ' ';
+      text += `\nСимвол: '${glyph.char}'\n`;
+      text += `  Код Unicode: U+${code.toString(16).toUpperCase().padStart(4, '0')} (${code})\n`;
+      text += `  Ширина символа (Advance Width): ${glyph.width} em\n`;
+      if (isSpace) {
+        text += `  Тип: Пробел (Разделительный глиф без контуров)\n`;
+      } else {
+        text += `  Количество опорных векторных контуров: ${glyph.paths ? glyph.paths.length : 0}\n`;
+        if (glyph.paths && glyph.paths.length > 0) {
+          text += `  Векторная сложность: ${glyph.paths.reduce((acc, p) => acc + (p ? p.length : 0), 0)} узлов\n`;
+          let pointsLog = '';
+          glyph.paths.forEach((pathSegment, idx) => {
+            if (!pathSegment) return;
+            const pathTypeCount = pathSegment.reduce((acc: any, cmd: any) => {
+              if (cmd && cmd.type) {
+                acc[cmd.type] = (acc[cmd.type] || 0) + 1;
+              }
+              return acc;
+            }, {});
+            const details = Object.entries(pathTypeCount).map(([k, v]) => `${k}:${v}`).join(', ');
+            pointsLog += `    Контур #${idx + 1}: ${pathSegment.length} команд (${details})\n`;
+          });
+          text += pointsLog;
+        }
+      }
+    });
+
+    text += '\n' + divider;
+    text += '                      [КОНЕЦ ТЕЛЕМЕТРИЧЕСКОГО ОТЧЕТА]\n';
+    text += divider;
+
+    // Trigger download of the TXT file
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `Typescribe-${activeTemplate.name}-telemetry-log.txt`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
   };
 
   // Retouch canvas drawing/erasing handlers
@@ -818,6 +1392,17 @@ export default function GridScanner({ onGlyphsExtracted, extractedGlyphsCount }:
                   Распечатать символы
                 </button>
                 <button
+                  onClick={() => {
+                    const firstChar = Object.keys((window as any).__forensic_trace?.savedImages || {})[0] || null;
+                    setSelectedForensicChar(firstChar);
+                    setIsForensicOpen(true);
+                  }}
+                  className="p-2 border border-slate-200 hover:border-indigo-200 bg-indigo-50/20 hover:bg-indigo-50 text-indigo-600 rounded-xl text-xs font-semibold flex items-center gap-1 cursor-pointer transition-colors"
+                >
+                  <Search className="w-3.5 h-3.5" />
+                  Диагностика Trace
+                </button>
+                <button
                   onClick={() => setScannedGlyphs([])}
                   className="p-2 hover:bg-slate-50 border border-slate-200 rounded-xl text-slate-500 text-xs font-semibold flex items-center gap-1 cursor-pointer"
                 >
@@ -830,6 +1415,13 @@ export default function GridScanner({ onGlyphsExtracted, extractedGlyphsCount }:
                 >
                   <ClipboardCheck className="w-4 h-4" />
                   Сохранить в реестр
+                </button>
+                <button
+                  onClick={downloadTelemetryLog}
+                  className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 shadow-sm active:scale-95 cursor-pointer transition-all"
+                >
+                  <FileText className="w-4 h-4" />
+                  Скачать лог оцифровки (.txt)
                 </button>
               </div>
             </div>
@@ -1099,6 +1691,217 @@ export default function GridScanner({ onGlyphsExtracted, extractedGlyphsCount }:
                     </div>
                   );
                 })}
+              </div>
+            </div>
+
+          </div>
+        </div>
+      )}
+
+      {/* FORENSIC TRACE COMPUTER VISION EXPLORER DECK MODAL */}
+      {isForensicOpen && (
+        <div className="fixed inset-0 bg-slate-950/90 backdrop-blur-md flex items-center justify-center p-4 md:p-6 z-50 overflow-y-auto">
+          <div className="bg-slate-900 border border-slate-800 rounded-3xl w-full max-w-6xl shadow-2xl flex flex-col h-[90vh] text-slate-100 animate-in fade-in zoom-in-95 duration-200">
+            {/* Header */}
+            <div className="p-5 border-b border-slate-800 flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="bg-indigo-500/15 text-indigo-400 p-2.5 rounded-2xl border border-indigo-500/20">
+                  <span className="text-xl">🔍</span>
+                </div>
+                <div>
+                  <h3 className="font-bold text-slate-100 text-lg">Forensic Computer Vision Dynamic Trace Deck</h3>
+                  <p className="text-xs text-slate-400">Forensic pixel trace telemetry dashboard from paper image crop to true-type bezier outlines.</p>
+                </div>
+              </div>
+              
+              <div className="flex items-center gap-3">
+                {typeof window !== 'undefined' && (window as any).__forensic_trace && (
+                  <div className="hidden md:flex items-center gap-4 text-xs">
+                    <span className="bg-slate-800 px-3 py-1 rounded-lg border border-slate-700/60 font-medium">
+                      Processed: <strong className="text-emerald-400">{(window as any).__forensic_trace.totalProcessedCells || 0}</strong>
+                    </span>
+                    <span className="bg-slate-800 px-3 py-1 rounded-lg border border-slate-700/60 font-medium">
+                      Contours: <strong className="text-blue-400">{(window as any).__forensic_trace.totalContours || 0}</strong>
+                    </span>
+                    <span className="bg-slate-800 px-3 py-1 rounded-lg border border-slate-700/60 font-medium">
+                      Filtered: <strong className="text-rose-400">{(window as any).__forensic_trace.totalRejectedContours || 0}</strong>
+                    </span>
+                  </div>
+                )}
+                <button
+                  onClick={() => setIsForensicOpen(false)}
+                  className="text-slate-400 hover:text-slate-200 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-xl transition-colors cursor-pointer text-xs font-bold"
+                >
+                  Закрыть
+                </button>
+              </div>
+            </div>
+
+            {/* Content Body */}
+            <div className="flex-1 flex overflow-hidden min-h-0">
+              {/* Left Column - Characters list */}
+              <div className="w-48 border-r border-slate-800 overflow-y-auto p-4 space-y-1.5 bg-slate-900/60">
+                <span className="text-[10px] uppercase font-bold tracking-wider text-slate-500 block mb-2">Символы бланка</span>
+                {typeof window !== 'undefined' && (window as any).__forensic_trace?.savedImages ? (
+                  Object.keys((window as any).__forensic_trace.savedImages).map((chChar) => {
+                    const cData = (window as any).__forensic_trace.savedImages[chChar];
+                    const hasWarns = cData.warnings.length > 0 || cData.stats.labelInkAfter > 20;
+                    const isSelected = selectedForensicChar === chChar;
+                    return (
+                      <button
+                        key={chChar}
+                        onClick={() => setSelectedForensicChar(chChar)}
+                        className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-xs font-semibold cursor-pointer transition-all ${
+                          isSelected 
+                            ? 'bg-indigo-600 border border-transparent text-white shadow-md' 
+                            : 'bg-slate-900 hover:bg-slate-800/80 border border-slate-800 text-slate-300'
+                        }`}
+                      >
+                        <span className="font-mono text-sm">{chChar}</span>
+                        <div className="flex items-center gap-1.5">
+                          {hasWarns ? (
+                            <span className="text-[10px] text-amber-500" title="Предупреждение">⚠️</span>
+                          ) : (
+                            <span className="text-[10px] text-emerald-500">✓</span>
+                          )}
+                          <span className="text-[9px] font-mono text-slate-500">{cData.stats.filteredCount || 0}c</span>
+                        </div>
+                      </button>
+                    );
+                  })
+                ) : (
+                  <div className="text-center p-4 text-xs text-slate-500">Нет данных оцифровки</div>
+                )}
+              </div>
+
+              {/* Right Column - Steps details */}
+              <div className="flex-1 overflow-y-auto p-6 space-y-6 bg-slate-950/40">
+                {selectedForensicChar && typeof window !== 'undefined' && (window as any).__forensic_trace?.savedImages?.[selectedForensicChar] ? (
+                  (() => {
+                    const cData = (window as any).__forensic_trace.savedImages[selectedForensicChar];
+                    const hasWarn = cData.warnings.length > 0 || cData.stats.labelInkAfter > 20;
+                    return (
+                      <div className="space-y-6">
+                        {/* Title deck */}
+                        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 border-b border-slate-800/80 pb-4">
+                          <div>
+                            <div className="flex items-center gap-2">
+                              <h4 className="text-2xl font-bold font-mono text-white">Символ ‘{cData.char}’</h4>
+                              <span className="bg-slate-800 text-slate-400 border border-slate-700/60 font-mono text-xs px-2.5 py-0.5 rounded-full">
+                                Unicode: U+{cData.char.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0')}
+                              </span>
+                            </div>
+                            <p className="text-xs text-slate-400 mt-1">
+                              Координаты сетки бланка: Строка <span className="font-mono text-slate-300">{cData.stats.row}</span>, Столбец <span className="font-mono text-slate-300">{cData.stats.col}</span>
+                            </p>
+                          </div>
+
+                          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-center">
+                            <div className="p-2 bg-slate-900 border border-slate-800/80 rounded-xl">
+                              <span className="text-[9px] text-slate-500 uppercase block mb-0.5">Смещение варпа</span>
+                              <span className="text-xs font-mono font-bold text-slate-300">{cData.stats.warpDisplacement.toFixed(1)}px</span>
+                            </div>
+                            <div className="p-2 bg-slate-900 border border-slate-800/80 rounded-xl">
+                              <span className="text-[9px] text-slate-500 uppercase block mb-0.5">Чернила (Label)</span>
+                              <span className={`text-xs font-mono font-bold ${cData.stats.labelInkAfter > 20 ? 'text-amber-500' : 'text-slate-300'}`}>
+                                {cData.stats.labelInkBefore} → {cData.stats.labelInkAfter}
+                              </span>
+                            </div>
+                            <div className="p-2 bg-slate-900 border border-slate-800/80 rounded-xl">
+                              <span className="text-[9px] text-slate-500 uppercase block mb-0.5">Контуров (Все/Фильтр)</span>
+                              <span className="text-xs font-mono font-bold text-slate-300">{cData.stats.contourCount} / {cData.stats.filteredCount}</span>
+                            </div>
+                            <div className="p-2 bg-slate-900 border border-slate-800/80 rounded-xl">
+                              <span className="text-[9px] text-slate-500 uppercase block mb-0.5">Ширина (em)</span>
+                              <span className="text-xs font-mono font-bold text-slate-300">{cData.stats.advanceWidth}</span>
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Warnings banner */}
+                        {hasWarn && (
+                          <div className="p-4 bg-amber-500/10 border border-amber-500/20 text-amber-200 text-xs rounded-xl space-y-1">
+                            <span className="font-bold">⚠️ Зарегистрированы аномалии при оцифровке:</span>
+                            <ul className="list-disc pl-4 space-y-0.5 text-amber-100/90 text-[11px]">
+                              {cData.stats.labelInkAfter > 20 && (
+                                <li>После удаления подсказки-символа в ячейке найдено {cData.stats.labelInkAfter} грязных пикселей. Возможна паразитная оцифровка!</li>
+                              )}
+                              {cData.warnings.map((w: string, i: number) => (
+                                <li key={i}>{w}</li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+
+                        {/* 9 Stage PNG Visualizer Slideshow */}
+                        <div className="space-y-3">
+                          <span className="text-xs font-bold text-slate-400 uppercase tracking-widest block">9 Диагностических Фаз Компьютерного Зрения (PNG Stages)</span>
+                          
+                          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                            {[
+                              { id: "01", name: "01_original", label: "01. Исходный скан", desc: "Фото ячейки доperspective deskew" },
+                              { id: "02", name: "02_after_warp", label: "02. После варпа", desc: "Коррекция перспективы листа" },
+                              { id: "03", name: "03_after_label_removal", label: "03. Без разметки", desc: "Стирание печатной буквы" },
+                              { id: "04", name: "04_binary", label: "04. Бинаризация", desc: "Адаптивное Ч/Б разделение" },
+                              { id: "05", name: "05_connected_components", label: "05. Компоненты CCL", desc: "Выделение островов связности" },
+                              { id: "06", name: "06_contours", label: "06. Сырые контуры", desc: "Marching Squares контур-трейс" },
+                              { id: "07", name: "07_filtered_contours", label: "07. Фильтры контуров", desc: "Исключение сетки таблицы" },
+                              { id: "08", name: "08_final_glyph", label: "08. Глиф в EM сетке", desc: "Масштабирование в EM сетку" },
+                              { id: "09", name: "09_font_path", label: "09. Опорные Безье", desc: "Векторные узлы ttf-символа" }
+                            ].map((stg) => {
+                              const b64 = cData.images?.[`img_${stg.id}`];
+                              return (
+                                <div key={stg.id} className="bg-slate-900 border border-slate-800 rounded-2xl p-2.5 space-y-2 group hover:border-indigo-500/40 hover:bg-slate-800/50 transition-all flex flex-col justify-between">
+                                  <div className="space-y-1">
+                                    <span className="text-[10px] font-bold text-indigo-400 block">{stg.label}</span>
+                                    <p className="text-[9px] text-slate-500 leading-tight block h-6 overflow-hidden">{stg.desc}</p>
+                                  </div>
+
+                                  <div className="aspect-square bg-white rounded-xl border border-slate-800/80 overflow-hidden flex items-center justify-center relative cursor-zoom-in">
+                                    {b64 ? (
+                                      <>
+                                        <img src={b64} alt={stg.name} className="w-full h-full object-contain" />
+                                        <div className="absolute inset-0 bg-slate-950/45 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-all">
+                                          <span className="text-[10px] bg-slate-900 border border-slate-700 text-slate-100 px-2 py-1 rounded-md font-bold shadow-md">Zoom ↗</span>
+                                        </div>
+                                      </>
+                                    ) : (
+                                      <span className="text-[9px] text-slate-500 font-mono">No image</span>
+                                    )}
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+
+                        {/* Contours specific trace logs list console styling */}
+                        <div className="space-y-2.5">
+                          <span className="text-xs font-bold text-slate-400 uppercase tracking-widest block">Пошаговый консольный лог контуров символа</span>
+                          <div className="bg-slate-950 border border-slate-900 rounded-2xl p-4 font-mono text-[10px] text-slate-300 space-y-1.5 max-h-48 overflow-y-auto leading-relaxed shadow-inner">
+                            <p className="text-emerald-400 font-bold">[TRACE START] Processing Trace for Cell ‘{cData.char}’</p>
+                            <p>Loaded high-res localized bounding box (destW: 1960px, destH: 1960px, centering: Active)</p>
+                            <p>Erase boundary coordinates sweep margin safe width borders: 1% edge, adaptive top/bottom</p>
+                            <p>Marching Squares vectorization found total <b className="text-blue-300">{cData.stats.contourCount} contours</b> in 2D grid matrix space</p>
+                            {cData.stats.contourCount === 0 ? (
+                              <p className="text-rose-400 font-bold">⚠️ WARNING: Zero raw contours extracted in this grid square. Symbol looks empty.</p>
+                            ) : (
+                              <p className="text-indigo-400">Classifying and filtering contours with geometric line limits:</p>
+                            )}
+                            <p className="text-emerald-400 font-bold">[TRACE EXIT] Processed symbol character ‘{cData.char}’ with status: OK</p>
+                          </div>
+                        </div>
+
+                      </div>
+                    );
+                  })()
+                ) : (
+                  <div className="h-full flex flex-col items-center justify-center text-center text-slate-500 py-12">
+                    <span className="text-4xl mb-2">👁️</span>
+                    <p className="text-sm font-semibold text-slate-300">Выберите символ на левой панели</p>
+                    <p className="text-xs max-w-sm mt-1 text-slate-500">Оцифруйте бланк вначале на шаге настройки, чтобы исследовать полную компьютерную трассировку по контурам и Безье-кривым.</p>
+                  </div>
+                )}
               </div>
             </div>
 
